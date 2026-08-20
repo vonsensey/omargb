@@ -10,7 +10,7 @@ FAILED=0
 python3 -m unittest discover -s "$HERE" -p 'test_*.py' || FAILED=1
 
 # QML logic probes (pure .js modules, no Quickshell import needed).
-for probe in "$HERE"/probe_*.mjs; do
+for probe in "$HERE"/probe_*.qml; do
   [ -e "$probe" ] || continue
   out=$(QT_FORCE_STDERR_LOGGING=1 QT_QPA_PLATFORM=offscreen qml6 "$probe" 2>&1)
   if echo "$out" | grep -q 'ALL PROBES PASSED'; then
