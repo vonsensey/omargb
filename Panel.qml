@@ -188,6 +188,11 @@ Item {
               fontFamily: root.fontFamily
               onClicked: if (root.svc) root.svc.send({ cmd: "power", on: !root.powerOn })
             }
+            PanelActionButton {
+              iconText: "󰆓"
+              tooltipText: "Persist current colors to device flash"
+              onClicked: if (root.svc) root.svc.send({ cmd: "persist" })
+            }
           }
         }
 
@@ -466,6 +471,38 @@ Item {
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.small
                       anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+
+                  // Hardware mode: OmaRGB drives Direct for theme mapping,
+                  // but the device's own effects are one pick away.
+                  Row {
+                    spacing: Style.space(8)
+                    visible: (deviceCard.dev.modes || []).length > 1
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: "Mode"
+                      textFormat: Text.PlainText
+                      color: root.foreground
+                      opacity: 0.6
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.small
+                    }
+                    Dropdown {
+                      width: Style.space(150)
+                      showLabel: false
+                      options: deviceCard.dev.modes || []
+                      value: {
+                        var m = deviceCard.dev.modes || []
+                        var a = Number(deviceCard.dev.activeMode)
+                        return a >= 0 && a < m.length ? String(m[a]) : ""
+                      }
+                      onChanged: function(v) {
+                        var m = deviceCard.dev.modes || []
+                        var idx = m.indexOf(v)
+                        if (idx >= 0 && root.svc)
+                          root.svc.send({ cmd: "mode", device: deviceCard.dev.key, mode: idx })
+                      }
                     }
                   }
 

@@ -857,6 +857,8 @@ class Bridge:
                 self.client.update_mode(idx, int(mode_idx), dev["modes"][int(mode_idx)])
                 self.direct_set.discard(idx)
                 self.applied.pop(idx, None)
+                dev["active_mode"] = int(mode_idx)
+                self.emit_rig()
             except OrgbError as e:
                 self.drop_connection(e)
         elif name == "persist":
