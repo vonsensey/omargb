@@ -26,6 +26,7 @@ import glob
 import json
 import os
 import queue
+import re
 import select
 import shutil
 import socket
@@ -39,6 +40,19 @@ import time
 
 MAGIC = b"ORGB"
 PROTOCOL_MAX = 5
+
+# The server is untrusted input (any local process can bind 6742 first).
+# OpenRGB itself caps packets at 8MB; forged counts beyond these bounds are
+# protocol errors, not data.
+MAX_PACKET_SIZE = 8 * 1024 * 1024
+MAX_ZONE_LEDS = 65535          # UpdateLEDs packs counts as u16 anyway
+MAX_MATRIX_DIM = 512
+
+HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}$")
+
+
+def valid_hex(value):
+    return isinstance(value, str) and bool(HEX_COLOR.match(value[:7]))
 
 PKT_REQUEST_CONTROLLER_COUNT = 0
 PKT_REQUEST_CONTROLLER_DATA = 1
@@ -171,9 +185,13 @@ def serialize_mode(m, ver):
 def parse_zone(r, ver):
     z = {"name": r.string(), "type": r.i32(), "leds_min": r.u32(),
          "leds_max": r.u32(), "leds_count": r.u32(), "matrix": None}
+    if z["leds_count"] > MAX_ZONE_LEDS:
+        raise OrgbError("zone claims %d LEDs" % z["leds_count"])
     matrix_len = r.u16()
     if matrix_len > 0:
         h, w = r.u32(), r.u32()
+        if h > MAX_MATRIX_DIM or w > MAX_MATRIX_DIM:
+            raise OrgbError("matrix claims %dx%d" % (h, w))
         z["matrix"] = {"height": h, "width": w,
                        "map": [r.u32() for _ in range(h * w)]}
     if ver >= 4:
@@ -283,6 +301,9 @@ class OrgbClient:
             self.close()
             raise OrgbError("bad magic, stream out of sync")
         dev_id, pkt_id, size = struct.unpack("<III", header[4:])
+        if size > MAX_PACKET_SIZE:
+            self.close()
+            raise OrgbError("oversized packet (%d bytes)" % size)
         payload = self._read_exact(size) if size else b""
         return dev_id, pkt_id, payload
 
@@ -318,6 +339,8 @@ class OrgbClient:
             _, payload = self._read_reply(PKT_REQUEST_PROTOCOL_VERSION)
             (server_ver,) = struct.unpack("<I", payload[:4])
             return min(server_ver, PROTOCOL_MAX)
+        except struct.error as e:
+            raise self._protocol_error(e)
         except OrgbError:
             if self.sock is None:
                 raise
@@ -332,17 +355,29 @@ class OrgbClient:
 
     # -- requests
 
+    def _protocol_error(self, err):
+        """Malformed bytes are a hostile/broken peer: same fate as a lost
+        connection, never a crash (struct.error must not escape)."""
+        self.close()
+        return OrgbError("malformed reply: %s" % err)
+
     def controller_count(self):
         self._send(0, PKT_REQUEST_CONTROLLER_COUNT)
         _, payload = self._read_reply(PKT_REQUEST_CONTROLLER_COUNT)
-        (count,) = struct.unpack("<I", payload[:4])
+        try:
+            (count,) = struct.unpack("<I", payload[:4])
+        except struct.error as e:
+            raise self._protocol_error(e)
         return count
 
     def controller_data(self, idx):
         payload = struct.pack("<I", self.protocol) if self.protocol >= 1 else b""
         self._send(idx, PKT_REQUEST_CONTROLLER_DATA, payload)
         _, reply = self._read_reply(PKT_REQUEST_CONTROLLER_DATA)
-        return parse_controller(reply, self.protocol)
+        try:
+            return parse_controller(reply, self.protocol)
+        except (struct.error, IndexError, MemoryError, OverflowError) as e:
+            raise self._protocol_error(e)
 
     def snapshot(self):
         self.rig_dirty = False
@@ -388,10 +423,13 @@ class OrgbClient:
             return []
         self._send(0, PKT_PROFILE_LIST)
         _, payload = self._read_reply(PKT_PROFILE_LIST)
-        r = Reader(payload)
-        r.u32()  # data_size
-        count = r.u16()
-        return [r.string() for _ in range(count)]
+        try:
+            r = Reader(payload)
+            r.u32()  # data_size
+            count = r.u16()
+            return [r.string() for _ in range(count)]
+        except (struct.error, IndexError) as e:
+            raise self._protocol_error(e)
 
     def profile_save(self, name):
         if self.protocol < 2:
@@ -422,13 +460,16 @@ def state_path(state_dir):
 
 
 def load_state(state_dir):
-    state = dict(DEFAULT_STATE)
+    # Deep copy: the nested default dicts must never be shared with (or
+    # mutated through) a live state. A hand-edited state.json with wrong
+    # types falls back to the default for that key instead of crashing later.
+    state = json.loads(json.dumps(DEFAULT_STATE))
     try:
         with open(state_path(state_dir)) as f:
             data = json.load(f)
         if isinstance(data, dict):
-            for key in DEFAULT_STATE:
-                if key in data:
+            for key, default in DEFAULT_STATE.items():
+                if key in data and isinstance(data[key], type(default)):
                     state[key] = data[key]
     except (OSError, ValueError):
         pass
@@ -457,10 +498,10 @@ ROLE_FALLBACK = "accent"
 def resolve_role(palette, role):
     """Role name -> '#rrggbb' from the resolved theme palette."""
     value = palette.get(role)
-    if isinstance(value, str) and value.startswith("#") and len(value) >= 7:
+    if valid_hex(value):
         return value[:7]
     value = palette.get(ROLE_FALLBACK)
-    if isinstance(value, str) and value.startswith("#") and len(value) >= 7:
+    if valid_hex(value):
         return value[:7]
     return "#ffffff"
 
@@ -487,6 +528,8 @@ def compute_targets(rig, state):
         colors = []
         for zone_idx, zone in enumerate(dev.get("zones", [])):
             override = overrides.get(str(zone_idx))
+            if override is not None and not valid_hex(override):
+                override = None
             base = override or resolve_role(state["palette"], zone_role(state, key, zone_idx))
             colors.extend([scale_color(base, factor)] * zone["leds_count"])
         led_total = len(dev.get("leds", []))
@@ -527,8 +570,12 @@ def _read_file(path):
 
 
 def doctor_checks(root="/", host="127.0.0.1", port=6742,
-                  which=shutil.which, device_count=None):
-    """Setup diagnosis. Every probe is parameterized so tests can fake a box."""
+                  which=shutil.which, device_count=None, reachable=None):
+    """Setup diagnosis. Every probe is parameterized so tests can fake a box.
+
+    reachable=True skips the TCP probe (the bridge already holds a live
+    connection); None means probe.
+    """
     checks = []
 
     def add(check_id, status, summary, fix=None):
@@ -543,14 +590,17 @@ def doctor_checks(root="/", host="127.0.0.1", port=6742,
             "OpenRGB is not installed - it is the engine OmaRGB drives",
             "sudo pacman -S openrgb")
 
-    try:
-        probe = socket.create_connection((host, port), timeout=0.6)
-        probe.close()
+    if reachable is None:
+        try:
+            probe = socket.create_connection((host, port), timeout=0.6)
+            probe.close()
+            reachable = True
+        except OSError:
+            reachable = False
+    if reachable:
         add("server-reachable", "ok",
             "OpenRGB SDK server is answering on %s:%d" % (host, port))
-        reachable = True
-    except OSError:
-        reachable = False
+    else:
         if openrgb:
             add("server-reachable", "warn",
                 "No SDK server on %s:%d - OmaRGB starts one on demand, or enable it at login"
@@ -642,9 +692,13 @@ class Bridge:
         self.direct_set = set()    # device indexes already switched to Direct
         self.overlay = None        # None | ("dim", f) | ("flash", color)
         self.flash_until = None
+        # Devices (by key) the user moved to a hardware effect mode: theme
+        # applies, overlays, and brightness leave them alone until an explicit
+        # per-device action or a theme change reclaims them.
+        self.hw_mode = set()
         self.retry_delay = 1.0
         self.next_retry = 0.0
-        self.spawn_attempted = False
+        self.spawn_last = 0.0      # monotonic time of the last spawn attempt
         self.commands = queue.Queue()
         self.running = True
 
@@ -676,21 +730,26 @@ class Bridge:
         self.applied = {}
         emit({"event": "connected", "protocol": client.protocol})
         self.refresh_rig()
-        if self.state["palette"]:
+        if self.client is not None and self.state["palette"]:
             self.apply()
-        return True
+        # refresh_rig or apply may have dropped the connection mid-setup;
+        # reporting success then would crash the run loop on a None client.
+        return self.client is not None and self.client.connected
 
     def maybe_spawn_server(self):
-        if not self.spawn_server or self.spawn_attempted:
+        # One attempt per minute, not one per process lifetime: openrgb may
+        # get installed, or a spawned server may die, while we keep running.
+        if not self.spawn_server or time.monotonic() - self.spawn_last < 60.0:
             return
         if self.host not in ("127.0.0.1", "localhost"):
             return
         if not shutil.which("openrgb"):
             return
-        self.spawn_attempted = True
+        self.spawn_last = time.monotonic()
         try:
             subprocess.Popen(
-                ["openrgb", "--server", "--server-host", "127.0.0.1",
+                ["openrgb", "--startminimized", "--server",
+                 "--server-host", "127.0.0.1",
                  "--server-port", str(self.port)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True)
@@ -752,15 +811,26 @@ class Bridge:
     # -- applying colors
 
     def apply(self, force=False):
-        """Push current base+overlay targets to every device that changed."""
+        """Push current base+overlay targets to every device that changed.
+
+        Returns True when anything was written. Emits a light "colors" event
+        rather than the full rig - re-shipping the immutable topology on
+        every color change makes the shell rebuild whole matrix views.
+        """
         if self.client is None or not self.client.connected:
-            return
+            return False
+        if not self.state["palette"]:
+            # Never paint without a palette: the accent fallback would flood
+            # the rig white on lock/brightness before the first theme lands.
+            return False
         self.base_targets = compute_targets(self.rig, self.state)
         effective = overlay_targets(self.base_targets, self.overlay)
         changed = []
         for idx, colors in effective.items():
             if not colors:
                 continue
+            if idx < len(self.rig) and device_key(self.rig[idx]) in self.hw_mode:
+                continue  # the user picked a hardware effect; hands off
             if not force and self.applied.get(idx) == colors:
                 continue
             try:
@@ -770,15 +840,22 @@ class Bridge:
                 self.client.update_leds(idx, [color_to_wire(c) for c in colors])
             except OrgbError as e:
                 self.drop_connection(e)
-                return
+                return False
             self.applied[idx] = list(colors)
             changed.append(idx)
         if changed:
             emit({"event": "applied", "devices": changed})
-            self.emit_rig()
+            emit({"event": "colors",
+                  "devices": {str(i): self.applied[i] for i in changed}})
+        return bool(changed)
 
     def persist_state(self):
-        save_state(self.state_dir, self.state)
+        try:
+            save_state(self.state_dir, self.state)
+        except OSError as e:
+            # A full or read-only disk must not kill the lights; keep serving
+            # the in-memory state and say so once per failure.
+            emit({"event": "error", "message": "could not save state: %s" % e})
 
     def find_device(self, key):
         for idx, dev in enumerate(self.rig):
@@ -802,38 +879,44 @@ class Bridge:
                         palette[parts[0].strip()] = parts[1].strip()
             if isinstance(palette, dict) and palette:
                 self.state["palette"] = palette
+                # An explicit theme change restyles the whole rig, including
+                # devices previously parked on a hardware effect.
+                self.hw_mode = set()
                 self.persist_state()
                 self.apply()
                 self.emit_rig()
         elif name == "set-role":
             key, role = cmd.get("device"), cmd.get("role", ROLE_FALLBACK)
             zone = cmd.get("zone")
-            if key is None:
+            if not isinstance(key, str):
                 return
             if zone is None:
                 self.state["roles"][key] = role
             else:
                 self.state["zone_roles"].setdefault(key, {})[str(zone)] = role
-            self.state["overrides"].get(key, {}).pop(str(zone), None)
+                self.state["overrides"].get(key, {}).pop(str(zone), None)
+            self.hw_mode.discard(key)
             self.persist_state()
             self.apply()
             self.emit_rig()
         elif name == "set-zone-color":
             key, zone, color = cmd.get("device"), cmd.get("zone"), cmd.get("color")
-            if key is None or zone is None or not color:
+            if not isinstance(key, str) or zone is None or not valid_hex(color):
                 return
-            self.state["overrides"].setdefault(key, {})[str(zone)] = color
+            self.state["overrides"].setdefault(key, {})[str(zone)] = color[:7]
+            self.hw_mode.discard(key)
             self.persist_state()
             self.apply()
             self.emit_rig()
         elif name == "clear-override":
             key, zone = cmd.get("device"), cmd.get("zone")
-            if key is None:
+            if not isinstance(key, str):
                 return
             if zone is None:
                 self.state["overrides"].pop(key, None)
             else:
                 self.state["overrides"].get(key, {}).pop(str(zone), None)
+            self.hw_mode.discard(key)
             self.persist_state()
             self.apply()
             self.emit_rig()
@@ -841,12 +924,16 @@ class Bridge:
             self.state["brightness"] = max(0, min(100, int(cmd.get("value", 100))))
             self.persist_state()
             self.apply()
+            self.emit_rig()
         elif name == "power":
             self.state["power"] = bool(cmd.get("on", True))
+            self.hw_mode = set()
             self.persist_state()
             self.apply()
             self.emit_rig()
         elif name == "mode":
+            if self.client is None or not self.client.connected:
+                return
             key, mode_idx = cmd.get("device"), cmd.get("mode")
             idx, dev = self.find_device(key)
             if dev is None or mode_idx is None:
@@ -858,10 +945,23 @@ class Bridge:
                 self.direct_set.discard(idx)
                 self.applied.pop(idx, None)
                 dev["active_mode"] = int(mode_idx)
+                # A picked hardware effect is the user's choice: theme applies
+                # and overlays skip this device until something reclaims it.
+                if dev["modes"][int(mode_idx)]["name"] == "Direct":
+                    self.hw_mode.discard(key)
+                else:
+                    self.hw_mode.add(key)
                 self.emit_rig()
             except OrgbError as e:
                 self.drop_connection(e)
         elif name == "persist":
+            if self.client is None or not self.client.connected:
+                return
+            if self.client.protocol < 3:
+                emit({"event": "error",
+                      "message": "this OpenRGB server (protocol %d) cannot save to flash"
+                      % self.client.protocol})
+                return
             for idx, dev in enumerate(self.rig):
                 active = dev.get("active_mode", 0)
                 if 0 <= active < len(dev["modes"]):
@@ -894,6 +994,11 @@ class Bridge:
                 self.direct_set = set()
                 self.applied = {}
                 self.refresh_rig()
+                # Deliberately no apply(): loading a profile means the user
+                # wants THAT look, not our targets painted over it. Park every
+                # device so overlays/brightness leave the profile alone; the
+                # next theme change (or per-device action) reclaims them.
+                self.hw_mode = {device_key(d) for d in self.rig}
         elif name == "overlay-dim":
             self.overlay = ("dim", max(0.0, min(1.0, float(cmd.get("factor", 0.15)))))
             self.flash_until = None
@@ -912,10 +1017,12 @@ class Bridge:
             self.flash_until = None
             self.apply(force=True)
         elif name == "doctor":
-            count = len(self.rig) if (self.client and self.client.connected) else None
+            connected = bool(self.client and self.client.connected)
+            count = len(self.rig) if connected else None
             emit({"event": "doctor",
                   "checks": doctor_checks(host=self.host, port=self.port,
-                                          device_count=count)})
+                                          device_count=count,
+                                          reachable=True if connected else None)})
         elif name == "rescan":
             if self.client and self.client.connected:
                 self.direct_set = set()
@@ -961,7 +1068,13 @@ class Bridge:
                 cmd = self.commands.get(timeout=0.2)
             except queue.Empty:
                 continue
-            self.handle(cmd)
+            try:
+                self.handle(cmd)
+            except Exception as e:  # noqa: BLE001 - a bad command value must
+                # never take the bridge down; report and keep serving.
+                emit({"event": "error",
+                      "message": "%s handling %s: %s"
+                      % (type(e).__name__, cmd.get("cmd"), e)})
 
 
 def default_state_dir():

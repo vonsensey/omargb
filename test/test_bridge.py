@@ -252,13 +252,21 @@ class BridgeIntegration(unittest.TestCase):
     def test_state_survives_bridge_restart(self):
         self.bridge.handle({"cmd": "set-palette", "raw": "accent\t#f38d70\n"})
         self.bridge.handle({"cmd": "brightness", "value": 40})
+        # Settle the wire, then retire the first bridge like a real restart.
+        self.wait_packets(1050, 12)
+        self.bridge.client.close()
+        before = len(self.server.control_packets(1050))
         again = B.Bridge("127.0.0.1", self.server.port,
                          self.state_dir, spawn_server=False)
         self.assertEqual(again.state["brightness"], 40)
         self.assertEqual(again.state["palette"]["accent"], "#f38d70")
-        before = len(self.server.control_packets(1050))
         self.assertTrue(again.ensure_connected())
+        self.assertIsNotNone(again.client)
+        self.addCleanup(again.client.close)
         # Reconnect re-applies the saved look without being asked.
+        deadline = time.time() + 2
+        while len(self.server.control_packets(1050)) <= before and time.time() < deadline:
+            time.sleep(0.01)
         self.assertGreater(len(self.server.control_packets(1050)), before)
 
 

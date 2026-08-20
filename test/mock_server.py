@@ -26,11 +26,13 @@ PKT_PROFILE_LOAD = 152
 
 class MockOrgbServer:
     def __init__(self, rig, protocol=5, mute_version=False, refuse_first=0,
-                 port=0):
+                 port=0, truncate_controller=False, close_after=None):
         self.rig = list(rig)
         self.protocol = protocol
         self.mute_version = mute_version
         self.refuse_first = refuse_first
+        self.truncate_controller = truncate_controller  # malformed replies
+        self.close_after = close_after  # close the conn after N packets
         self.received = []          # (dev_id, pkt_id, payload) control packets
         self.client_name = None
         self.profiles = ["default"]
@@ -86,18 +88,24 @@ class MockOrgbServer:
                 continue
             with self.lock:
                 self.conn = conn
+            # One thread per connection: reconnecting clients (a restarted
+            # bridge) must be served, not queued behind a dead first client.
+            threading.Thread(target=self._serve_conn, args=(conn,),
+                             daemon=True).start()
+
+    def _serve_conn(self, conn):
+        try:
+            self._serve(conn)
+        except OSError:
+            pass
+        finally:
             try:
-                self._serve(conn)
+                conn.close()
             except OSError:
                 pass
-            finally:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
-                with self.lock:
-                    if self.conn is conn:
-                        self.conn = None
+            with self.lock:
+                if self.conn is conn:
+                    self.conn = None
 
     def _read_exact(self, conn, n):
         buf = b""
@@ -112,11 +120,16 @@ class MockOrgbServer:
         conn.sendall(orgb_wire.header(dev_id, pkt_id, len(payload)) + payload)
 
     def _serve(self, conn):
+        packets_seen = 0
         while self.running:
             head = self._read_exact(conn, 16)
             assert head[:4] == orgb_wire.MAGIC, "client sent bad magic"
             dev_id, pkt_id, size = struct.unpack("<III", head[4:])
             payload = self._read_exact(conn, size) if size else b""
+            packets_seen += 1
+            if self.close_after is not None and packets_seen > self.close_after:
+                conn.close()
+                return
 
             if pkt_id == PKT_REQUEST_PROTOCOL_VERSION:
                 if not self.mute_version:
@@ -133,8 +146,10 @@ class MockOrgbServer:
                     (ver,) = struct.unpack("<I", payload[:4])
                 ver = min(ver, self.protocol)
                 if dev_id < len(self.rig):
-                    self._reply(conn, dev_id, PKT_REQUEST_CONTROLLER_DATA,
-                                orgb_wire.controller(self.rig[dev_id], ver))
+                    blob = orgb_wire.controller(self.rig[dev_id], ver)
+                    if self.truncate_controller:
+                        blob = blob[:len(blob) // 2]
+                    self._reply(conn, dev_id, PKT_REQUEST_CONTROLLER_DATA, blob)
             elif pkt_id == PKT_PROFILE_LIST:
                 body = struct.pack("<H", len(self.profiles))
                 for name in self.profiles:

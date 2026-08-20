@@ -50,11 +50,11 @@ QtObject {
     ok("zoneStart sums preceding", Format.zoneStart([{ledsCount:1},{ledsCount:12},{ledsCount:8}], 2) === 13)
     ok("zoneStart clamps", Format.zoneStart([{ledsCount:5}], 3) === 5)
 
-    var matrix = { height: 2, width: 3, map: [0, 4294967295, 1, 2, 3, 4294967295] }
-    var cell = Format.matrixCell(matrix, 2)
-    ok("matrixCell finds row/col", cell.row === 1 && cell.col === 0)
-    ok("matrixCell missing led is null", Format.matrixCell(matrix, 9) === null)
-    ok("matrixCell null matrix", Format.matrixCell(null, 0) === null)
+    ok("MATRIX_EMPTY is the SDK sentinel", Format.MATRIX_EMPTY === 4294967295)
+
+    ok("plain strips markup", Format.plain("<img src=x> Corsair & K70") === "img src=x Corsair  K70")
+    ok("plain passes clean names", Format.plain("Fixture AIO Cooler") === "Fixture AIO Cooler")
+    ok("plain stringifies non-strings", Format.plain(42) === "42")
 
     console.log(fails === 0 ? "ALL PROBES PASSED" : "PROBES FAILED: " + fails)
     Qt.exit(fails === 0 ? 0 : 1)

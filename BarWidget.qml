@@ -26,17 +26,23 @@ BarWidget {
   implicitWidth: root.vertical ? barSize : row.width + Style.space(14)
   implicitHeight: root.vertical ? row.height + Style.space(14) : barSize
 
-  Row {
+  // A Grid so the swatch+state pair stacks in vertical bars instead of the
+  // state text vanishing - the widget must show its state in all four
+  // orientations.
+  Grid {
     id: row
     anchors.centerIn: parent
-    spacing: Style.space(5)
+    columns: root.vertical ? 1 : 2
+    columnSpacing: Style.space(5)
+    rowSpacing: Style.space(3)
+    horizontalItemAlignment: Grid.AlignHCenter
+    verticalItemAlignment: Grid.AlignVCenter
 
     Rectangle {
       id: swatch
       width: Style.space(11)
       height: width
       radius: width / 2
-      anchors.verticalCenter: parent.verticalCenter
       color: root.healthy && root.powerOn ? Color.accent : "transparent"
       border.width: Math.max(1, Style.spaceReal(1))
       border.color: root.bar ? root.bar.barForeground : Color.foreground
@@ -44,8 +50,6 @@ BarWidget {
     }
 
     Text {
-      anchors.verticalCenter: parent.verticalCenter
-      visible: !root.vertical
       textFormat: Text.PlainText
       color: root.bar ? root.bar.barForeground : Color.foreground
       font.family: root.bar ? root.bar.fontFamily : ""

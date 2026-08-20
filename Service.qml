@@ -4,6 +4,7 @@ import Quickshell.Io
 import Quickshell.Hyprland
 import qs.Commons
 import "lib/format.js" as Format
+import "lib/settings.js" as SettingsLib
 
 // OmaRGB service: the shell's half of the bridge conversation.
 //
@@ -30,31 +31,10 @@ Item {
   // ------------------------------------------------------------- settings
   // Read from the bar layout entry the widget writes, exactly as the widget
   // reads them, so changes land without a shell restart (omajam pattern).
-  readonly property var settings: lookupSettings(shell ? shell.shellConfig : null, pluginId)
-
-  function lookupSettings(config, id) {
-    if (!config || !id) return ({})
-    var sections = ["left", "center", "right"]
-    if (config.bar && config.bar.layout) {
-      for (var s = 0; s < sections.length; s++) {
-        var list = config.bar.layout[sections[s]]
-        if (!Array.isArray(list)) continue
-        for (var i = 0; i < list.length; i++) {
-          if (list[i] && String(list[i].id) === id) return list[i]
-        }
-      }
-    }
-    if (Array.isArray(config.plugins)) {
-      for (var j = 0; j < config.plugins.length; j++) {
-        if (config.plugins[j] && String(config.plugins[j].id) === id) return config.plugins[j]
-      }
-    }
-    return ({})
-  }
+  readonly property var settings: SettingsLib.lookupSettings(shell ? shell.shellConfig : null, pluginId)
 
   function setting(name, fallback) {
-    var value = settings ? settings[name] : undefined
-    return value === undefined || value === null ? fallback : value
+    return SettingsLib.setting(settings, name, fallback)
   }
 
   readonly property bool followTheme: Format.isOn(setting("followTheme", "On"), true)
@@ -65,10 +45,15 @@ Item {
   property bool serverConnected: false
   property int protocol: 0
   property var devices: []
+  // Live per-LED colors keyed by device index (as string). Separate from
+  // `devices` so routine color changes update bindings without rebuilding
+  // the panel's delegates (a full rig reassignment recreates every matrix cell).
+  property var colorsByDevice: ({})
   property var rigState: ({})
   property var doctorChecks: []
   property var profiles: []
   property string lastError: ""
+  property int bridgeCrashes: 0
 
   readonly property bool bridgeUp: bridge.running
   readonly property int deviceCount: devices.length
@@ -97,19 +82,36 @@ Item {
       serverConnected = true
       protocol = Number(msg.protocol) || 0
       lastError = ""
+      bridgeCrashes = 0
       refreshPalette()
       send({ cmd: "doctor" })
       send({ cmd: "profile-list" })
+      // The session may already be locked when we (re)start - e.g. a bridge
+      // restart or plugin load behind the lock screen. No changed signal
+      // will fire for a state that was true all along, so re-assert it.
+      if (sessionLocked) applyLockAction()
       break
     case "disconnected":
       serverConnected = false
       devices = []
+      colorsByDevice = ({})
       // With no server the Doctor is the whole story - keep it current.
       if (doctorChecks.length === 0) send({ cmd: "doctor" })
       break
     case "rig":
       devices = msg.devices || []
       rigState = msg.state || ({})
+      var byDev = {}
+      for (var i = 0; i < devices.length; i++)
+        byDev[String(devices[i].index)] = devices[i].colors || []
+      colorsByDevice = byDev
+      break
+    case "colors":
+      var merged = {}
+      for (var k in colorsByDevice) merged[k] = colorsByDevice[k]
+      var incoming = msg.devices || {}
+      for (var d in incoming) merged[d] = incoming[d]
+      colorsByDevice = merged
       break
     case "doctor":
       doctorChecks = msg.checks || []
@@ -127,9 +129,10 @@ Item {
   Process {
     id: bridge
     running: false
-    // Through the interpreter rather than the shebang so a checkout that
-    // lost its executable bit still works.
-    command: ["python3", root.sourceDir + "/bin/omargb-bridge"]
+    // Pinned system interpreter: version-manager shims (mise/pyenv) can put
+    // an arbitrary python3 first on PATH. Invoked through the interpreter
+    // rather than the shebang so a checkout without exec bits still works.
+    command: ["/usr/bin/python3", root.sourceDir + "/bin/omargb-bridge"]
     stdinEnabled: true
     stdout: SplitParser {
       splitMarker: "\n"
@@ -137,6 +140,10 @@ Item {
     }
     onExited: {
       root.serverConnected = false
+      root.bridgeCrashes += 1
+      // A bridge that dies instantly must not busy-loop the shell: after a
+      // few rapid deaths, back off hard. Any successful connect resets this.
+      restartTimer.interval = root.bridgeCrashes > 5 ? 30000 : 2000
       restartTimer.restart()
     }
   }
@@ -198,8 +205,13 @@ Item {
     command: ["omarchy-theme-color", "--all"]
     stdout: StdioCollector { id: paletteOut }
     onExited: function(code) {
-      if (code === 0 && paletteOut.text !== "")
-        root.send({ cmd: "set-palette", raw: paletteOut.text })
+      if (code === 0 && paletteOut.text !== "") {
+        // The resolver does not emit `urgent` (it is a shell-derived role,
+        // not a colors.toml key) - append the shell's resolved value so the
+        // urgent role maps to the color users expect.
+        root.send({ cmd: "set-palette",
+                    raw: paletteOut.text + "\nurgent\t" + Format.hex6(Color.urgent) })
+      }
     }
   }
 
@@ -209,10 +221,14 @@ Item {
   readonly property var lockService: shell ? shell.serviceFor("omarchy.lock") : null
   readonly property bool sessionLocked: lockService ? lockService.locked === true : false
 
+  function applyLockAction() {
+    if (lockAction === "Dim") send({ cmd: "overlay-dim", factor: 0.08 })
+    else if (lockAction === "Lights off") send({ cmd: "overlay-off" })
+  }
+
   onSessionLockedChanged: {
     if (sessionLocked) {
-      if (lockAction === "Dim") send({ cmd: "overlay-dim", factor: 0.08 })
-      else if (lockAction === "Lights off") send({ cmd: "overlay-off" })
+      applyLockAction()
     } else if (lockAction !== "Nothing") {
       send({ cmd: "overlay-clear" })
     }
@@ -222,6 +238,9 @@ Item {
     target: Hyprland
     function onRawEvent(event) {
       if (!root.urgentFlash) return
+      // No flashes behind the lock screen: the flash's expiry would restore
+      // full brightness while the session is still locked.
+      if (root.sessionLocked) return
       if (String(event.name) !== "urgent") return
       root.send({ cmd: "overlay-flash", color: Format.hex6(Color.urgent),
                   duration_ms: 700 })

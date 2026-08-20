@@ -45,6 +45,32 @@ Item {
     }
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
+
+  // Automation surface: everything the panel can do, a script or agent can
+  // do headlessly through the shell IPC -
+  //   omarchy-shell shell call io.github.vonsensey.omargb command '{"cmd":"power","on":false}'
+  //   omarchy-shell shell call io.github.vonsensey.omargb status ""
+  function command(payloadJson) {
+    if (!root.svc) return "no service"
+    var cmd
+    try { cmd = JSON.parse(payloadJson) } catch (e) { return "bad json" }
+    if (!cmd || typeof cmd.cmd !== "string") return "missing cmd"
+    root.svc.send(cmd)
+    return "ok"
+  }
+
+  function status() {
+    if (!root.svc) return "{}"
+    return JSON.stringify({
+      connected: root.svc.serverConnected,
+      protocol: root.svc.protocol,
+      power: root.svc.powerOn,
+      brightness: root.svc.brightness,
+      profiles: root.svc.profiles,
+      doctor: root.svc.doctorChecks,
+      devices: root.svc.devices
+    })
+  }
   function close() {
     root.pickerZone = -1
     root.opened = false
@@ -62,7 +88,8 @@ Item {
 
   function zoneSwatch(dev, zoneIdx) {
     var start = Format.zoneStart(dev.zones, zoneIdx)
-    if (dev.colors && dev.colors.length > start) return dev.colors[start]
+    var colors = (root.svc && root.svc.colorsByDevice[String(dev.index)]) || dev.colors
+    if (colors && colors.length > start) return colors[start]
     return "#000000"
   }
 
@@ -119,12 +146,13 @@ Item {
             root.showDoctor = !root.showDoctor
             event.accepted = true
           } else if (event.key === Qt.Key_Minus || event.key === Qt.Key_Underscore) {
+            // No || fallback: 0 is falsy and would jump 0 -> 90.
             if (root.svc) root.svc.send({ cmd: "brightness",
-              value: Math.max(0, (root.svc.brightness || 100) - 10) })
+              value: Math.max(0, root.svc.brightness - 10) })
             event.accepted = true
           } else if (event.key === Qt.Key_Plus || event.key === Qt.Key_Equal) {
             if (root.svc) root.svc.send({ cmd: "brightness",
-              value: Math.min(100, (root.svc.brightness || 100) + 10) })
+              value: Math.min(100, root.svc.brightness + 10) })
             event.accepted = true
           }
         }
@@ -264,7 +292,9 @@ Item {
               model: root.svc ? root.svc.profiles : []
               delegate: Button {
                 required property var modelData
-                text: String(modelData)
+                // plain(): profile names come from the server and Button
+                // sets no textFormat of its own.
+                text: Format.plain(modelData)
                 bordered: true
                 fontFamily: root.fontFamily
                 tooltipText: "Load OpenRGB profile"
@@ -297,7 +327,9 @@ Item {
         Flickable {
           id: content
           width: parent.width
-          height: parent.height - y
+          // Leave room for the footer hint below - `parent.height - y` alone
+          // pushes it off the card.
+          height: parent.height - y - footerHint.implicitHeight - parent.spacing
           contentHeight: root.showDoctor || !root.connected
             ? doctorColumn.implicitHeight : deviceColumn.implicitHeight
           clip: true
@@ -491,15 +523,16 @@ Item {
                     Dropdown {
                       width: Style.space(150)
                       showLabel: false
-                      options: deviceCard.dev.modes || []
+                      // Sanitized copies for display (mode names are
+                      // server-provided); selection maps back by position.
+                      readonly property var saneModes: (deviceCard.dev.modes || []).map(Format.plain)
+                      options: saneModes
                       value: {
-                        var m = deviceCard.dev.modes || []
                         var a = Number(deviceCard.dev.activeMode)
-                        return a >= 0 && a < m.length ? String(m[a]) : ""
+                        return a >= 0 && a < saneModes.length ? saneModes[a] : ""
                       }
                       onChanged: function(v) {
-                        var m = deviceCard.dev.modes || []
-                        var idx = m.indexOf(v)
+                        var idx = saneModes.indexOf(v)
                         if (idx >= 0 && root.svc)
                           root.svc.send({ cmd: "mode", device: deviceCard.dev.key, mode: idx })
                       }
@@ -597,17 +630,22 @@ Item {
                           ? Math.max(4, Math.floor((devCol.width - (matrixWrap.matrix.width - 1) * spacing) / matrixWrap.matrix.width))
                           : 6
                         readonly property int start: Format.zoneStart(deviceCard.dev.zones, matrixWrap.zone.index)
+                        // Live colors come from the light per-device color
+                        // stream, so routine repaints touch only this binding
+                        // and never rebuild the cell delegates.
+                        readonly property var liveColors:
+                          (root.svc && root.svc.colorsByDevice[String(deviceCard.dev.index)]) || deviceCard.dev.colors
 
                         Repeater {
                           model: matrixWrap.matrix ? matrixWrap.matrix.map : []
                           delegate: Rectangle {
                             required property var modelData
-                            readonly property bool empty: Number(modelData) === 4294967295
+                            readonly property bool empty: Number(modelData) === Format.MATRIX_EMPTY
                             width: matrixGrid.cell
                             height: matrixGrid.cell
                             radius: Math.max(1, matrixGrid.cell / 4)
                             color: empty ? "transparent"
-                              : (deviceCard.dev.colors[matrixGrid.start + Number(modelData)] || "#000000")
+                              : (matrixGrid.liveColors[matrixGrid.start + Number(modelData)] || "#000000")
                             border.width: empty ? 0 : 1
                             border.color: root.faint
                           }
@@ -623,6 +661,7 @@ Item {
 
         // ------------------------------------------------------- footer
         Text {
+          id: footerHint
           width: parent.width
           horizontalAlignment: Text.AlignHCenter
           text: "Esc close · P lights · D doctor · +/- brightness · swatch = pick a color"
