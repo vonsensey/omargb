@@ -117,6 +117,19 @@ Item {
     Rectangle { anchors.fill: parent; color: Color.menu.scrim }
     MouseArea { anchors.fill: parent; onClicked: root.close() }
 
+    // Esc must close no matter which control holds keyboard focus - after a
+    // Dropdown or the profile field is used, the keyCatcher's Keys handler
+    // never sees the key. A window-context shortcut always does.
+    Shortcut {
+      enabled: root.opened
+      sequence: "Escape"
+      context: Qt.WindowShortcut
+      onActivated: {
+        if (root.pickerZone >= 0) root.pickerZone = -1
+        else root.close()
+      }
+    }
+
     BorderSurface {
       id: card
       width: Math.min(Style.space(680), panel.width - Style.gapsOut * 2)
