@@ -38,15 +38,41 @@ BarWidget {
     horizontalItemAlignment: Grid.AlignHCenter
     verticalItemAlignment: Grid.AlignVCenter
 
-    Rectangle {
+    // The RGB triad: three dots wearing the theme's own red, green, and
+    // blue - the plugin's name, drawn. Dimmed hollow until there is a
+    // palette-wearing rig to show.
+    Item {
       id: swatch
-      width: Style.space(11)
-      height: width
-      radius: width / 2
-      color: root.healthy && root.powerOn ? Color.accent : "transparent"
-      border.width: Math.max(1, Style.spaceReal(1))
-      border.color: root.bar ? root.bar.barForeground : Color.foreground
+      width: Style.space(13)
+      height: Style.space(12)
       opacity: root.powerOn ? 1.0 : 0.4
+
+      // Literal channel colors, deliberately: these are the hardware's
+      // R/G/B, which no desktop theme redefines (ristretto's "blue" is
+      // salmon). Same color-literal class as the panel's hue bar - a glyph
+      // whose meaning IS the colors. Softened so they sit on any bar.
+      readonly property bool lit: root.healthy
+      readonly property real dot: Style.space(7)
+      readonly property color rim: root.bar ? root.bar.barForeground : Color.foreground
+
+      Rectangle {  // green, bottom-left
+        width: swatch.dot; height: swatch.dot; radius: swatch.dot / 2
+        x: 0; y: swatch.height - height
+        color: swatch.lit ? "#44bb55" : "transparent"
+        border.width: 1; border.color: swatch.rim
+      }
+      Rectangle {  // blue, bottom-right
+        width: swatch.dot; height: swatch.dot; radius: swatch.dot / 2
+        x: swatch.width - width; y: swatch.height - height
+        color: swatch.lit ? "#4477ee" : "transparent"
+        border.width: 1; border.color: swatch.rim
+      }
+      Rectangle {  // red on top, centered
+        width: swatch.dot; height: swatch.dot; radius: swatch.dot / 2
+        x: (swatch.width - width) / 2; y: 0
+        color: swatch.lit ? "#ee4444" : "transparent"
+        border.width: 1; border.color: swatch.rim
+      }
     }
 
     Text {
