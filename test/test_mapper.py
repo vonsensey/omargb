@@ -60,6 +60,13 @@ class Mapper(unittest.TestCase):
         targets = B.compute_targets(rig(), s)
         self.assertEqual(targets[4][0], "#123456")
 
+    def test_off_role_is_black_while_others_wear_theme(self):
+        s = state(roles={"KB77": "off", "MS12": "off"})
+        targets = B.compute_targets(rig(), s)
+        self.assertTrue(all(c == "#000000" for c in targets[3]))
+        self.assertTrue(all(c == "#000000" for c in targets[4]))
+        self.assertTrue(all(c == "#f38d70" for c in targets[5]))  # cooler themed
+
     def test_unknown_role_falls_back_to_accent(self):
         s = state(roles={"KB77": "no-such-role"})
         targets = B.compute_targets(rig(), s)

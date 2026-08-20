@@ -497,6 +497,10 @@ ROLE_FALLBACK = "accent"
 
 def resolve_role(palette, role):
     """Role name -> '#rrggbb' from the resolved theme palette."""
+    if role == "off":
+        # A real role, not just power: one device dark while the rest of the
+        # rig wears the theme (keyboard dark at night, cooler still themed).
+        return "#000000"
     value = palette.get(role)
     if valid_hex(value):
         return value[:7]

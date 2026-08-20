@@ -25,7 +25,7 @@ Item {
   property bool showDoctor: false
 
   readonly property var roles: ["accent", "foreground", "background", "muted",
-    "urgent", "red", "orange", "yellow", "green", "cyan", "blue", "magenta"]
+    "urgent", "red", "orange", "yellow", "green", "cyan", "blue", "magenta", "off"]
 
   // Color picker session state.
   property string pickerDevice: ""
