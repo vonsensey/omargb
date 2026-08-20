@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.vonsensey.omargb",
+  "name": "OmaRGB",
+  "version": "1.0.0",
+  "author": "vonsensey",
+  "license": "MIT",
+  "description": "Every RGB device, wearing your theme. An OpenRGB-powered control center: live full-palette theme sync for keyboards, mice, coolers, RAM and cases, per-zone color roles, a real keyboard matrix view, lock and urgent reactive lighting, and a Doctor that diagnoses stubborn Arch RGB setups with copyable fixes.",
+  "kinds": ["service", "bar-widget", "panel"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaRGB",
+    "description": "Device count and the color your rig is wearing. Click for the control room; right click toggles all lights.",
+    "category": "Hardware",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "followTheme": "On",
+      "lockAction": "Dim",
+      "urgentFlash": "On"
+    },
+    "schema": [
+      { "key": "followTheme", "type": "enum", "label": "Follow the Omarchy theme", "options": ["On", "Off"], "defaultValue": "On", "description": "Repaint every managed device from the theme palette the moment the theme changes." },
+      { "key": "lockAction", "type": "enum", "label": "When the session locks", "options": ["Dim", "Lights off", "Nothing"], "defaultValue": "Dim", "description": "Lights restore to their exact previous state on unlock." },
+      { "key": "urgentFlash", "type": "enum", "label": "Flash on urgent window", "options": ["On", "Off"], "defaultValue": "On", "description": "Pulse managed devices in the theme's urgent color when a window demands attention." }
+    ]
+  }
+}
