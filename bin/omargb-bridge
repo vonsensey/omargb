@@ -1,0 +1,1006 @@
+#!/usr/bin/python3
+"""omargb-bridge -- OmaRGB's connection to OpenRGB.
+
+The Omarchy shell (Quickshell) cannot open TCP sockets from QML -- its Socket
+type is unix-domain only and every IO stream is text-typed -- and the OpenRGB
+SDK speaks a binary protocol on 127.0.0.1:6742. So this bridge exists: the
+shell runs it as a child process and talks JSON, one object per line, stdin
+for commands and stdout for events. The bridge holds the one persistent SDK
+connection, keeps the device rig enumerated, maps Omarchy theme palettes onto
+zones, and restores state after server restarts.
+
+Pure python3 stdlib. No pip packages, no venv, no daemons installed. The only
+network traffic this program ever produces is the loopback connection to the
+OpenRGB SDK server (and it will spawn `openrgb --server --server-host
+127.0.0.1` for you if none is running).
+
+Protocol: OpenRGB SDK, negotiated up to version 5 (what Arch's openrgb
+1.0rc3 ships). Wire format: 16-byte header {magic "ORGB", device u32,
+packet u32, size u32}, little-endian throughout. RGBColor is
+(blue<<16)|(green<<8)|red, i.e. bytes r,g,b,0 on the wire.
+
+CLI: `omargb-bridge doctor` prints the setup diagnosis as JSON and exits.
+"""
+
+import glob
+import json
+import os
+import queue
+import select
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+# ------------------------------------------------------------------ protocol
+
+MAGIC = b"ORGB"
+PROTOCOL_MAX = 5
+
+PKT_REQUEST_CONTROLLER_COUNT = 0
+PKT_REQUEST_CONTROLLER_DATA = 1
+PKT_REQUEST_PROTOCOL_VERSION = 40
+PKT_SET_CLIENT_NAME = 50
+PKT_DEVICE_LIST_UPDATED = 100
+PKT_PROFILE_LIST = 150
+PKT_PROFILE_SAVE = 151
+PKT_PROFILE_LOAD = 152
+PKT_RGB_UPDATE_LEDS = 1050
+PKT_RGB_UPDATE_ZONE_LEDS = 1051
+PKT_RGB_UPDATE_SINGLE_LED = 1052
+PKT_RGB_SET_CUSTOM_MODE = 1100
+PKT_RGB_UPDATE_MODE = 1101
+PKT_RGB_SAVE_MODE = 1102
+
+ZONE_SINGLE, ZONE_LINEAR, ZONE_MATRIX = 0, 1, 2
+MATRIX_EMPTY = 0xFFFFFFFF
+
+DEVICE_TYPE_NAMES = [
+    "motherboard", "dram", "gpu", "cooler", "ledstrip", "keyboard",
+    "mouse", "mousemat", "headset", "headset-stand", "gamepad", "light",
+    "speaker", "virtual", "storage", "case", "microphone", "accessory",
+    "keypad",
+]
+
+
+def device_type_name(t):
+    if 0 <= t < len(DEVICE_TYPE_NAMES):
+        return DEVICE_TYPE_NAMES[t]
+    return "unknown"
+
+
+def color_to_wire(hexcolor):
+    """'#rrggbb' -> RGBColor u32 ((b<<16)|(g<<8)|r)."""
+    h = hexcolor.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (b << 16) | (g << 8) | r
+
+
+def wire_to_color(value):
+    r = value & 0xFF
+    g = (value >> 8) & 0xFF
+    b = (value >> 16) & 0xFF
+    return "#%02x%02x%02x" % (r, g, b)
+
+
+def scale_color(hexcolor, factor):
+    """Software brightness: scale each channel, clamped. Black stays black."""
+    h = hexcolor.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    f = max(0.0, min(1.0, factor))
+    return "#%02x%02x%02x" % (round(r * f), round(g * f), round(b * f))
+
+
+def pack_header(dev_id, pkt_id, size):
+    return MAGIC + struct.pack("<III", dev_id, pkt_id, size)
+
+
+def pack_string(s):
+    """Length-prefixed string: u16 length INCLUDING the null, bytes, null."""
+    raw = s.encode("utf-8") + b"\x00"
+    return struct.pack("<H", len(raw)) + raw
+
+
+class Reader:
+    """Cursor over a controller-data blob."""
+
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+
+    def u16(self):
+        (v,) = struct.unpack_from("<H", self.data, self.pos)
+        self.pos += 2
+        return v
+
+    def u32(self):
+        (v,) = struct.unpack_from("<I", self.data, self.pos)
+        self.pos += 4
+        return v
+
+    def i32(self):
+        (v,) = struct.unpack_from("<i", self.data, self.pos)
+        self.pos += 4
+        return v
+
+    def string(self):
+        n = self.u16()
+        raw = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return raw.rstrip(b"\x00").decode("utf-8", "replace")
+
+
+def parse_mode(r, ver):
+    m = {"name": r.string(), "value": r.i32(), "flags": r.u32(),
+         "speed_min": r.u32(), "speed_max": r.u32()}
+    if ver >= 3:
+        m["brightness_min"] = r.u32()
+        m["brightness_max"] = r.u32()
+    m["colors_min"] = r.u32()
+    m["colors_max"] = r.u32()
+    m["speed"] = r.u32()
+    if ver >= 3:
+        m["brightness"] = r.u32()
+    m["direction"] = r.u32()
+    m["color_mode"] = r.u32()
+    num_colors = r.u16()
+    m["colors"] = [r.u32() for _ in range(num_colors)]
+    return m
+
+
+def serialize_mode(m, ver):
+    out = pack_string(m["name"])
+    out += struct.pack("<iI", m["value"], m["flags"])
+    out += struct.pack("<II", m["speed_min"], m["speed_max"])
+    if ver >= 3:
+        out += struct.pack("<II", m.get("brightness_min", 0), m.get("brightness_max", 0))
+    out += struct.pack("<II", m["colors_min"], m["colors_max"])
+    out += struct.pack("<I", m["speed"])
+    if ver >= 3:
+        out += struct.pack("<I", m.get("brightness", 0))
+    out += struct.pack("<II", m["direction"], m["color_mode"])
+    out += struct.pack("<H", len(m["colors"]))
+    for c in m["colors"]:
+        out += struct.pack("<I", c)
+    return out
+
+
+def parse_zone(r, ver):
+    z = {"name": r.string(), "type": r.i32(), "leds_min": r.u32(),
+         "leds_max": r.u32(), "leds_count": r.u32(), "matrix": None}
+    matrix_len = r.u16()
+    if matrix_len > 0:
+        h, w = r.u32(), r.u32()
+        z["matrix"] = {"height": h, "width": w,
+                       "map": [r.u32() for _ in range(h * w)]}
+    if ver >= 4:
+        num_segments = r.u16()
+        z["segments"] = [
+            {"name": r.string(), "type": r.i32(),
+             "start_idx": r.u32(), "leds_count": r.u32()}
+            for _ in range(num_segments)
+        ]
+    if ver >= 5:
+        z["flags"] = r.u32()
+    return z
+
+
+def parse_controller(data, ver):
+    r = Reader(data)
+    r.u32()  # data_size, trust the packet framing instead
+    dev = {"type": r.i32(), "name": r.string()}
+    if ver >= 1:
+        dev["vendor"] = r.string()
+    else:
+        dev["vendor"] = ""
+    dev["description"] = r.string()
+    dev["version"] = r.string()
+    dev["serial"] = r.string()
+    dev["location"] = r.string()
+    num_modes = r.u16()
+    dev["active_mode"] = r.i32()
+    dev["modes"] = [parse_mode(r, ver) for _ in range(num_modes)]
+    num_zones = r.u16()
+    dev["zones"] = [parse_zone(r, ver) for _ in range(num_zones)]
+    num_leds = r.u16()
+    dev["leds"] = [{"name": r.string(), "value": r.u32()} for _ in range(num_leds)]
+    num_colors = r.u16()
+    dev["colors"] = [r.u32() for _ in range(num_colors)]
+    return dev
+
+
+class OrgbError(Exception):
+    pass
+
+
+class OrgbClient:
+    """One SDK connection. All calls happen on the owning thread."""
+
+    def __init__(self, host="127.0.0.1", port=6742, timeout=4.0, name="OmaRGB"):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.client_name = name
+        self.sock = None
+        self.protocol = 0
+        self.rig_dirty = False
+
+    # -- plumbing
+
+    def connect(self):
+        self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        self.sock.settimeout(self.timeout)
+        self.protocol = self._negotiate()
+        self._send(0, PKT_SET_CLIENT_NAME,
+                   self.client_name.encode("utf-8") + b"\x00")
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+    @property
+    def connected(self):
+        return self.sock is not None
+
+    def fileno(self):
+        return self.sock.fileno()
+
+    def _send(self, dev_id, pkt_id, payload=b""):
+        if self.sock is None:
+            raise OrgbError("not connected")
+        try:
+            self.sock.sendall(pack_header(dev_id, pkt_id, len(payload)) + payload)
+        except OSError as e:
+            self.close()
+            raise OrgbError("send failed: %s" % e)
+
+    def _read_exact(self, n):
+        buf = b""
+        while len(buf) < n:
+            try:
+                chunk = self.sock.recv(n - len(buf))
+            except socket.timeout:
+                raise OrgbError("read timeout")
+            except OSError as e:
+                self.close()
+                raise OrgbError("read failed: %s" % e)
+            if not chunk:
+                self.close()
+                raise OrgbError("server closed connection")
+            buf += chunk
+        return buf
+
+    def _read_packet(self):
+        header = self._read_exact(16)
+        if header[:4] != MAGIC:
+            self.close()
+            raise OrgbError("bad magic, stream out of sync")
+        dev_id, pkt_id, size = struct.unpack("<III", header[4:])
+        payload = self._read_exact(size) if size else b""
+        return dev_id, pkt_id, payload
+
+    def _read_reply(self, want_pkt_id):
+        """Read until the expected reply; unsolicited pushes set rig_dirty."""
+        while True:
+            dev_id, pkt_id, payload = self._read_packet()
+            if pkt_id == want_pkt_id:
+                return dev_id, payload
+            if pkt_id == PKT_DEVICE_LIST_UPDATED:
+                self.rig_dirty = True
+                continue
+            # Unknown unsolicited packet: ignore rather than desync.
+
+    def poll_push(self):
+        """Drain any unsolicited packets waiting on the socket (non-blocking)."""
+        if self.sock is None:
+            return
+        while True:
+            r, _, _ = select.select([self.sock], [], [], 0)
+            if not r:
+                return
+            dev_id, pkt_id, payload = self._read_packet()
+            if pkt_id == PKT_DEVICE_LIST_UPDATED:
+                self.rig_dirty = True
+
+    def _negotiate(self):
+        """Exchange protocol versions; a silent server is protocol 0."""
+        self._send_raw_version()
+        old_timeout = self.sock.gettimeout()
+        self.sock.settimeout(1.0)
+        try:
+            _, payload = self._read_reply(PKT_REQUEST_PROTOCOL_VERSION)
+            (server_ver,) = struct.unpack("<I", payload[:4])
+            return min(server_ver, PROTOCOL_MAX)
+        except OrgbError:
+            if self.sock is None:
+                raise
+            return 0
+        finally:
+            if self.sock is not None:
+                self.sock.settimeout(old_timeout)
+
+    def _send_raw_version(self):
+        self._send(0, PKT_REQUEST_PROTOCOL_VERSION,
+                   struct.pack("<I", PROTOCOL_MAX))
+
+    # -- requests
+
+    def controller_count(self):
+        self._send(0, PKT_REQUEST_CONTROLLER_COUNT)
+        _, payload = self._read_reply(PKT_REQUEST_CONTROLLER_COUNT)
+        (count,) = struct.unpack("<I", payload[:4])
+        return count
+
+    def controller_data(self, idx):
+        payload = struct.pack("<I", self.protocol) if self.protocol >= 1 else b""
+        self._send(idx, PKT_REQUEST_CONTROLLER_DATA, payload)
+        _, reply = self._read_reply(PKT_REQUEST_CONTROLLER_DATA)
+        return parse_controller(reply, self.protocol)
+
+    def snapshot(self):
+        self.rig_dirty = False
+        return [self.controller_data(i) for i in range(self.controller_count())]
+
+    # -- control
+
+    def set_custom_mode(self, idx):
+        self._send(idx, PKT_RGB_SET_CUSTOM_MODE)
+
+    def update_leds(self, idx, wire_colors):
+        body = struct.pack("<H", len(wire_colors))
+        body += b"".join(struct.pack("<I", c) for c in wire_colors)
+        payload = struct.pack("<I", 4 + len(body)) + body
+        self._send(idx, PKT_RGB_UPDATE_LEDS, payload)
+
+    def update_zone_leds(self, idx, zone_idx, wire_colors):
+        body = struct.pack("<IH", zone_idx, len(wire_colors))
+        body += b"".join(struct.pack("<I", c) for c in wire_colors)
+        payload = struct.pack("<I", 4 + len(body)) + body
+        self._send(idx, PKT_RGB_UPDATE_ZONE_LEDS, payload)
+
+    def update_single_led(self, idx, led_idx, wire_color):
+        self._send(idx, PKT_RGB_UPDATE_SINGLE_LED,
+                   struct.pack("<iI", led_idx, wire_color))
+
+    def update_mode(self, idx, mode_idx, mode):
+        body = struct.pack("<i", mode_idx) + serialize_mode(mode, self.protocol)
+        payload = struct.pack("<I", 4 + len(body)) + body
+        self._send(idx, PKT_RGB_UPDATE_MODE, payload)
+
+    def save_mode(self, idx, mode_idx, mode):
+        if self.protocol < 3:
+            raise OrgbError("SaveMode needs protocol >= 3")
+        body = struct.pack("<i", mode_idx) + serialize_mode(mode, self.protocol)
+        payload = struct.pack("<I", 4 + len(body)) + body
+        self._send(idx, PKT_RGB_SAVE_MODE, payload)
+
+    # -- profiles (protocol >= 2)
+
+    def profile_list(self):
+        if self.protocol < 2:
+            return []
+        self._send(0, PKT_PROFILE_LIST)
+        _, payload = self._read_reply(PKT_PROFILE_LIST)
+        r = Reader(payload)
+        r.u32()  # data_size
+        count = r.u16()
+        return [r.string() for _ in range(count)]
+
+    def profile_save(self, name):
+        if self.protocol < 2:
+            raise OrgbError("profiles need protocol >= 2")
+        self._send(0, PKT_PROFILE_SAVE, name.encode("utf-8") + b"\x00")
+
+    def profile_load(self, name):
+        if self.protocol < 2:
+            raise OrgbError("profiles need protocol >= 2")
+        self._send(0, PKT_PROFILE_LOAD, name.encode("utf-8") + b"\x00")
+
+
+# --------------------------------------------------------------------- state
+
+DEFAULT_STATE = {
+    "schemaVersion": 1,
+    "power": True,
+    "brightness": 100,
+    "roles": {},        # device key -> role name
+    "zone_roles": {},   # device key -> {zone index (str) -> role}
+    "overrides": {},    # device key -> {zone index (str) -> "#rrggbb"}
+    "palette": {},      # last palette received from the shell
+}
+
+
+def state_path(state_dir):
+    return os.path.join(state_dir, "state.json")
+
+
+def load_state(state_dir):
+    state = dict(DEFAULT_STATE)
+    try:
+        with open(state_path(state_dir)) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for key in DEFAULT_STATE:
+                if key in data:
+                    state[key] = data[key]
+    except (OSError, ValueError):
+        pass
+    return state
+
+
+def save_state(state_dir, state):
+    os.makedirs(state_dir, exist_ok=True)
+    tmp = state_path(state_dir) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, state_path(state_dir))
+
+
+def device_key(dev):
+    """Stable identity across reconnects: serial when real, else name."""
+    serial = (dev.get("serial") or "").strip()
+    return serial if serial else dev.get("name", "?")
+
+
+# ------------------------------------------------------------------- mapping
+
+ROLE_FALLBACK = "accent"
+
+
+def resolve_role(palette, role):
+    """Role name -> '#rrggbb' from the resolved theme palette."""
+    value = palette.get(role)
+    if isinstance(value, str) and value.startswith("#") and len(value) >= 7:
+        return value[:7]
+    value = palette.get(ROLE_FALLBACK)
+    if isinstance(value, str) and value.startswith("#") and len(value) >= 7:
+        return value[:7]
+    return "#ffffff"
+
+
+def zone_role(state, key, zone_idx):
+    per_zone = state["zone_roles"].get(key, {})
+    role = per_zone.get(str(zone_idx))
+    if role:
+        return role
+    return state["roles"].get(key, ROLE_FALLBACK)
+
+
+def compute_targets(rig, state):
+    """Per device index: the full per-LED hex color list this state wants.
+
+    Precedence per zone: manual override > zone role > device role.
+    Power off means black everywhere; brightness scales everything.
+    """
+    factor = (state["brightness"] / 100.0) if state["power"] else 0.0
+    targets = {}
+    for idx, dev in enumerate(rig):
+        key = device_key(dev)
+        overrides = state["overrides"].get(key, {})
+        colors = []
+        for zone_idx, zone in enumerate(dev.get("zones", [])):
+            override = overrides.get(str(zone_idx))
+            base = override or resolve_role(state["palette"], zone_role(state, key, zone_idx))
+            colors.extend([scale_color(base, factor)] * zone["leds_count"])
+        led_total = len(dev.get("leds", []))
+        if led_total > len(colors):
+            pad = resolve_role(state["palette"], state["roles"].get(key, ROLE_FALLBACK))
+            colors.extend([scale_color(pad, factor)] * (led_total - len(colors)))
+        targets[idx] = colors
+    return targets
+
+
+def overlay_targets(base, overlay):
+    """Apply a temporary overlay on top of the base targets."""
+    if overlay is None:
+        return base
+    kind = overlay[0]
+    out = {}
+    if kind == "dim":
+        factor = overlay[1]
+        for idx, colors in base.items():
+            out[idx] = [scale_color(c, factor) for c in colors]
+        return out
+    if kind == "flash":
+        color = overlay[1]
+        for idx, colors in base.items():
+            out[idx] = [color] * len(colors)
+        return out
+    return base
+
+
+# -------------------------------------------------------------------- doctor
+
+def _read_file(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def doctor_checks(root="/", host="127.0.0.1", port=6742,
+                  which=shutil.which, device_count=None):
+    """Setup diagnosis. Every probe is parameterized so tests can fake a box."""
+    checks = []
+
+    def add(check_id, status, summary, fix=None):
+        checks.append({"id": check_id, "status": status,
+                       "summary": summary, "fix": fix})
+
+    openrgb = which("openrgb")
+    if openrgb:
+        add("openrgb-installed", "ok", "OpenRGB is installed (%s)" % openrgb)
+    else:
+        add("openrgb-installed", "fail",
+            "OpenRGB is not installed - it is the engine OmaRGB drives",
+            "sudo pacman -S openrgb")
+
+    try:
+        probe = socket.create_connection((host, port), timeout=0.6)
+        probe.close()
+        add("server-reachable", "ok",
+            "OpenRGB SDK server is answering on %s:%d" % (host, port))
+        reachable = True
+    except OSError:
+        reachable = False
+        if openrgb:
+            add("server-reachable", "warn",
+                "No SDK server on %s:%d - OmaRGB starts one on demand, or enable it at login"
+                % (host, port),
+                "openrgb --autostart-enable \"--startminimized --server\"")
+        else:
+            add("server-reachable", "skip",
+                "No server to reach until OpenRGB is installed")
+
+    rules = [
+        os.path.join(root, "usr/lib/udev/rules.d/60-openrgb.rules"),
+        os.path.join(root, "etc/udev/rules.d/60-openrgb.rules"),
+    ]
+    if any(os.path.exists(p) for p in rules):
+        add("udev-rules", "ok", "OpenRGB udev rules are installed")
+    elif openrgb:
+        add("udev-rules", "warn",
+            "udev rules not found - USB devices may be invisible without root",
+            "openrgb --generate-udev-rules | sudo tee /etc/udev/rules.d/60-openrgb.rules && sudo udevadm control --reload && sudo udevadm trigger")
+    else:
+        add("udev-rules", "skip", "Installed with the openrgb package")
+
+    modules = _read_file(os.path.join(root, "proc/modules"))
+    if "i2c_dev" in modules:
+        add("i2c-dev", "ok", "i2c-dev kernel module is loaded")
+    else:
+        add("i2c-dev", "fail",
+            "i2c-dev module not loaded - RAM and motherboard RGB need it",
+            "sudo modprobe i2c-dev && echo i2c-dev | sudo tee /etc/modules-load.d/i2c.conf")
+
+    if glob.glob(os.path.join(root, "dev/i2c-*")):
+        add("i2c-nodes", "ok", "I2C device nodes are present")
+    else:
+        add("i2c-nodes", "warn",
+            "No /dev/i2c-* nodes - the chipset SMBus driver may be missing",
+            "sudo modprobe i2c-piix4   # AMD; use i2c-i801 on Intel")
+
+    board = _read_file(os.path.join(root, "sys/class/dmi/id/board_vendor")).strip().lower()
+    cmdline = _read_file(os.path.join(root, "proc/cmdline"))
+    if "gigabyte" in board or "aorus" in board:
+        if "acpi_enforce_resources" in cmdline:
+            add("gigabyte-acpi", "ok",
+                "acpi_enforce_resources is set for this Gigabyte board")
+        else:
+            add("gigabyte-acpi", "warn",
+                "Gigabyte boards often hide the SMBus behind an ACPI conflict",
+                "Add acpi_enforce_resources=lax to the kernel command line, then reboot")
+    else:
+        add("gigabyte-acpi", "skip", "Not a Gigabyte/Aorus board")
+
+    if "spd5118" in modules:
+        add("spd5118", "warn",
+            "The spd5118 driver can claim DDR5 RGB addresses (i2cdetect shows UU)",
+            "sudo rmmod spd5118")
+    else:
+        add("spd5118", "ok", "No spd5118 conflict")
+
+    if device_count is not None:
+        if device_count > 0:
+            add("devices", "ok", "%d RGB device(s) detected" % device_count)
+        elif reachable:
+            add("devices", "warn",
+                "Server is up but sees 0 devices - check the items above, then the OpenRGB device wiki",
+                "openrgb --loglevel 6   # run once in a terminal and read the detection log")
+        else:
+            add("devices", "skip", "No server connection yet")
+
+    return checks
+
+
+# ---------------------------------------------------------------- the bridge
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+class Bridge:
+    def __init__(self, host, port, state_dir, spawn_server=True):
+        self.host = host
+        self.port = port
+        self.state_dir = state_dir
+        self.spawn_server = spawn_server
+        self.state = load_state(state_dir)
+        self.client = None
+        self.rig = []
+        self.base_targets = {}
+        self.applied = {}          # what the devices are actually showing
+        self.direct_set = set()    # device indexes already switched to Direct
+        self.overlay = None        # None | ("dim", f) | ("flash", color)
+        self.flash_until = None
+        self.retry_delay = 1.0
+        self.next_retry = 0.0
+        self.spawn_attempted = False
+        self.commands = queue.Queue()
+        self.running = True
+
+    # -- connection lifecycle
+
+    def ensure_connected(self):
+        if self.client is not None and self.client.connected:
+            return True
+        now = time.monotonic()
+        if now < self.next_retry:
+            return False
+        client = OrgbClient(self.host, self.port)
+        try:
+            client.connect()
+        except OSError:
+            self.maybe_spawn_server()
+            self.next_retry = now + self.retry_delay
+            emit({"event": "disconnected", "retryIn": round(self.retry_delay, 1)})
+            self.retry_delay = min(self.retry_delay * 2, 15.0)
+            return False
+        except OrgbError as e:
+            self.next_retry = now + self.retry_delay
+            emit({"event": "error", "message": str(e)})
+            self.retry_delay = min(self.retry_delay * 2, 15.0)
+            return False
+        self.client = client
+        self.retry_delay = 1.0
+        self.direct_set = set()
+        self.applied = {}
+        emit({"event": "connected", "protocol": client.protocol})
+        self.refresh_rig()
+        if self.state["palette"]:
+            self.apply()
+        return True
+
+    def maybe_spawn_server(self):
+        if not self.spawn_server or self.spawn_attempted:
+            return
+        if self.host not in ("127.0.0.1", "localhost"):
+            return
+        if not shutil.which("openrgb"):
+            return
+        self.spawn_attempted = True
+        try:
+            subprocess.Popen(
+                ["openrgb", "--server", "--server-host", "127.0.0.1",
+                 "--server-port", str(self.port)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            emit({"event": "server-spawned"})
+        except OSError as e:
+            emit({"event": "error", "message": "could not start openrgb: %s" % e})
+
+    def drop_connection(self, err):
+        if self.client is not None:
+            self.client.close()
+        self.client = None
+        self.next_retry = time.monotonic() + self.retry_delay
+        emit({"event": "disconnected", "retryIn": round(self.retry_delay, 1),
+              "message": str(err)})
+        self.retry_delay = min(self.retry_delay * 2, 15.0)
+
+    # -- rig
+
+    def refresh_rig(self):
+        try:
+            self.rig = self.client.snapshot()
+        except OrgbError as e:
+            self.drop_connection(e)
+            return
+        self.emit_rig()
+
+    def emit_rig(self):
+        devices = []
+        for idx, dev in enumerate(self.rig):
+            key = device_key(dev)
+            devices.append({
+                "index": idx,
+                "key": key,
+                "name": dev["name"],
+                "type": dev["type"],
+                "typeName": device_type_name(dev["type"]),
+                "role": self.state["roles"].get(key, ROLE_FALLBACK),
+                "activeMode": dev["active_mode"],
+                "modes": [m["name"] for m in dev["modes"]],
+                "zones": [{
+                    "index": z_idx,
+                    "name": z["name"],
+                    "type": z["type"],
+                    "ledsCount": z["leds_count"],
+                    "role": zone_role(self.state, key, z_idx),
+                    "override": self.state["overrides"].get(key, {}).get(str(z_idx)),
+                    "matrix": z["matrix"],
+                } for z_idx, z in enumerate(dev.get("zones", []))],
+                "colors": [wire_to_color(c) for c in dev.get("colors", [])],
+            })
+        emit({"event": "rig", "devices": devices,
+              "state": {"power": self.state["power"],
+                        "brightness": self.state["brightness"],
+                        "hasPalette": bool(self.state["palette"])}})
+
+    # -- applying colors
+
+    def apply(self, force=False):
+        """Push current base+overlay targets to every device that changed."""
+        if self.client is None or not self.client.connected:
+            return
+        self.base_targets = compute_targets(self.rig, self.state)
+        effective = overlay_targets(self.base_targets, self.overlay)
+        changed = []
+        for idx, colors in effective.items():
+            if not colors:
+                continue
+            if not force and self.applied.get(idx) == colors:
+                continue
+            try:
+                if idx not in self.direct_set:
+                    self.client.set_custom_mode(idx)
+                    self.direct_set.add(idx)
+                self.client.update_leds(idx, [color_to_wire(c) for c in colors])
+            except OrgbError as e:
+                self.drop_connection(e)
+                return
+            self.applied[idx] = list(colors)
+            changed.append(idx)
+        if changed:
+            emit({"event": "applied", "devices": changed})
+
+    def persist_state(self):
+        save_state(self.state_dir, self.state)
+
+    def find_device(self, key):
+        for idx, dev in enumerate(self.rig):
+            if device_key(dev) == key:
+                return idx, dev
+        return None, None
+
+    # -- command handling
+
+    def handle(self, cmd):
+        name = cmd.get("cmd")
+        if name == "snapshot":
+            self.emit_rig()
+        elif name == "set-palette":
+            palette = cmd.get("palette")
+            if palette is None and "raw" in cmd:
+                palette = {}
+                for line in str(cmd["raw"]).splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 2 and parts[1].strip():
+                        palette[parts[0].strip()] = parts[1].strip()
+            if isinstance(palette, dict) and palette:
+                self.state["palette"] = palette
+                self.persist_state()
+                self.apply()
+                self.emit_rig()
+        elif name == "set-role":
+            key, role = cmd.get("device"), cmd.get("role", ROLE_FALLBACK)
+            zone = cmd.get("zone")
+            if key is None:
+                return
+            if zone is None:
+                self.state["roles"][key] = role
+            else:
+                self.state["zone_roles"].setdefault(key, {})[str(zone)] = role
+            self.state["overrides"].get(key, {}).pop(str(zone), None)
+            self.persist_state()
+            self.apply()
+            self.emit_rig()
+        elif name == "set-zone-color":
+            key, zone, color = cmd.get("device"), cmd.get("zone"), cmd.get("color")
+            if key is None or zone is None or not color:
+                return
+            self.state["overrides"].setdefault(key, {})[str(zone)] = color
+            self.persist_state()
+            self.apply()
+            self.emit_rig()
+        elif name == "clear-override":
+            key, zone = cmd.get("device"), cmd.get("zone")
+            if key is None:
+                return
+            if zone is None:
+                self.state["overrides"].pop(key, None)
+            else:
+                self.state["overrides"].get(key, {}).pop(str(zone), None)
+            self.persist_state()
+            self.apply()
+            self.emit_rig()
+        elif name == "brightness":
+            self.state["brightness"] = max(0, min(100, int(cmd.get("value", 100))))
+            self.persist_state()
+            self.apply()
+        elif name == "power":
+            self.state["power"] = bool(cmd.get("on", True))
+            self.persist_state()
+            self.apply()
+            self.emit_rig()
+        elif name == "mode":
+            key, mode_idx = cmd.get("device"), cmd.get("mode")
+            idx, dev = self.find_device(key)
+            if dev is None or mode_idx is None:
+                return
+            if not (0 <= int(mode_idx) < len(dev["modes"])):
+                return
+            try:
+                self.client.update_mode(idx, int(mode_idx), dev["modes"][int(mode_idx)])
+                self.direct_set.discard(idx)
+                self.applied.pop(idx, None)
+            except OrgbError as e:
+                self.drop_connection(e)
+        elif name == "persist":
+            for idx, dev in enumerate(self.rig):
+                active = dev.get("active_mode", 0)
+                if 0 <= active < len(dev["modes"]):
+                    try:
+                        self.client.save_mode(idx, active, dev["modes"][active])
+                    except OrgbError as e:
+                        self.drop_connection(e)
+                        return
+            emit({"event": "persisted"})
+        elif name == "profile-list":
+            try:
+                emit({"event": "profiles",
+                      "names": self.client.profile_list() if self.client else []})
+            except OrgbError as e:
+                self.drop_connection(e)
+        elif name == "profile-save":
+            if self.client and cmd.get("name"):
+                try:
+                    self.client.profile_save(str(cmd["name"]))
+                    emit({"event": "profiles", "names": self.client.profile_list()})
+                except OrgbError as e:
+                    self.drop_connection(e)
+        elif name == "profile-load":
+            if self.client and cmd.get("name"):
+                try:
+                    self.client.profile_load(str(cmd["name"]))
+                except OrgbError as e:
+                    self.drop_connection(e)
+                    return
+                self.direct_set = set()
+                self.applied = {}
+                self.refresh_rig()
+        elif name == "overlay-dim":
+            self.overlay = ("dim", max(0.0, min(1.0, float(cmd.get("factor", 0.15)))))
+            self.flash_until = None
+            self.apply(force=True)
+        elif name == "overlay-off":
+            self.overlay = ("dim", 0.0)
+            self.flash_until = None
+            self.apply(force=True)
+        elif name == "overlay-flash":
+            color = str(cmd.get("color", "#ff0000"))
+            self.overlay = ("flash", color)
+            self.flash_until = time.monotonic() + float(cmd.get("duration_ms", 600)) / 1000.0
+            self.apply(force=True)
+        elif name == "overlay-clear":
+            self.overlay = None
+            self.flash_until = None
+            self.apply(force=True)
+        elif name == "doctor":
+            count = len(self.rig) if (self.client and self.client.connected) else None
+            emit({"event": "doctor",
+                  "checks": doctor_checks(host=self.host, port=self.port,
+                                          device_count=count)})
+        elif name == "rescan":
+            if self.client and self.client.connected:
+                self.direct_set = set()
+                self.applied = {}
+                self.refresh_rig()
+                self.apply()
+        elif name == "quit":
+            self.running = False
+
+    # -- main loop
+
+    def stdin_reader(self):
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                self.commands.put(json.loads(line))
+            except ValueError:
+                emit({"event": "error", "message": "bad command json"})
+        self.commands.put({"cmd": "quit"})
+
+    def run(self):
+        threading.Thread(target=self.stdin_reader, daemon=True).start()
+        while self.running:
+            connected = self.ensure_connected()
+            if connected:
+                try:
+                    self.client.poll_push()
+                except OrgbError as e:
+                    self.drop_connection(e)
+                    connected = False
+            if connected and self.client.rig_dirty:
+                self.direct_set = set()
+                self.applied = {}
+                self.refresh_rig()
+                self.apply()
+            if self.flash_until is not None and time.monotonic() >= self.flash_until:
+                self.overlay = None
+                self.flash_until = None
+                self.apply(force=True)
+            try:
+                cmd = self.commands.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            self.handle(cmd)
+
+
+def default_state_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "omargb")
+
+
+def main(argv):
+    host, port = "127.0.0.1", 6742
+    state_dir = default_state_dir()
+    spawn = True
+    mode = "serve"
+    args = list(argv[1:])
+    while args:
+        arg = args.pop(0)
+        if arg == "--host":
+            host = args.pop(0)
+        elif arg == "--port":
+            port = int(args.pop(0))
+        elif arg == "--state-dir":
+            state_dir = args.pop(0)
+        elif arg == "--no-spawn":
+            spawn = False
+        elif arg == "doctor":
+            mode = "doctor"
+        else:
+            sys.stderr.write("unknown argument: %s\n" % arg)
+            return 2
+
+    if mode == "doctor":
+        count = None
+        try:
+            client = OrgbClient(host, port, timeout=2.0)
+            client.connect()
+            count = client.controller_count()
+            client.close()
+        except (OSError, OrgbError):
+            pass
+        print(json.dumps({"checks": doctor_checks(host=host, port=port,
+                                                  device_count=count)}, indent=2))
+        return 0
+
+    Bridge(host, port, state_dir, spawn_server=spawn).run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
