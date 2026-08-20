@@ -74,6 +74,28 @@ Your devices keep whatever colors they last showed (or whatever their
 firmware boots with). Note: removing just the bar widget from the bar
 disables the whole plugin — that is how Omarchy anchors bar-widget plugins.
 
+## What the roles mean
+
+A role is a **name from your theme's palette**, not an absolute color — the
+point is that everything re-resolves when the theme changes:
+
+| Role | What it resolves to |
+|---|---|
+| `accent` | The theme's main color — what selections and highlights wear. The default for every zone. |
+| `foreground` | The theme's text color (near-white on dark themes). A gentle "white-ish" glow. |
+| `background` | The theme's background (near-black on dark themes). Very dim, almost off. |
+| `muted` | The theme's dimmed-text color. Quiet. |
+| `urgent` | The attention color the shell uses for urgent windows. |
+| `red` … `magenta` | The theme's *named* colors — the ones your terminal shows as red, green, etc. |
+| `off` | Black. This device dark while the rest of the rig wears the theme. |
+
+The catch worth knowing: **themes lie about color names on purpose.** A jade
+theme like osaka-jade defines its `yellow` as a green (`#459451`) and its
+`blue` as jade too; ristretto's `blue` is salmon. Picking role `yellow` gives
+you *your theme's idea of yellow* — that is the feature. When you want an
+exact color regardless of theme, click the zone's swatch and pick it; that
+override sticks across theme changes until you clear it.
+
 ## How the theme mapping works
 
 Every zone resolves its color by precedence:
@@ -116,6 +138,11 @@ One semantic worth knowing: a device you move to a hardware effect (Breathing,
 Rainbow, a loaded profile) is *parked* — theme applies, lock dimming, and
 brightness leave it alone until you change its color or role, or switch
 themes (an explicit theme change restyles the whole rig).
+
+And a promise: **your colors stay put.** Wireless keyboards love to wake from
+power-save playing their onboard rainbow. A drift watchdog re-reads every
+managed device's colors (every 20s) and repaints anything that stopped showing
+what you chose. Parked devices are exempt — their own show runs freely.
 
 ## On real hardware
 

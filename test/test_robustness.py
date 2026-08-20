@@ -289,6 +289,39 @@ class ThemeVsHardwareModes(unittest.TestCase):
             time.sleep(0.01)
         self.assertTrue(kb, "keyboard repainted after theme change")
 
+    def test_drift_watchdog_reasserts_a_reverted_device(self):
+        import json as _json
+        # The keyboard "wakes up" playing onboard rainbow: only ITS server-side
+        # colors stop matching what we applied.
+        reverted = _json.loads(_json.dumps(self.server.rig))
+        reverted[3]["colors"] = [0x0000FF] * 104  # onboard red, not our accent
+        self.server.set_rig(reverted)
+        before = len([p for p in self.server.control_packets(1050) if p[0] == 3])
+        self.bridge.check_drift()
+        kb = self.wait_packets(7)
+        after = len([p for p in self.server.control_packets(1050) if p[0] == 3])
+        self.assertGreater(after, before)  # keyboard repainted
+        drift_events = [e for e in self.events if e.get("event") == "drift"]
+        self.assertEqual(drift_events[-1]["devices"], [3])
+        # And once re-asserted, the next pass is quiet.
+        n = len(self.server.control_packets(1050))
+        time.sleep(0.1)
+        self.bridge.check_drift()
+        time.sleep(0.1)
+        self.assertEqual(len(self.server.control_packets(1050)), n)
+
+    def test_drift_watchdog_leaves_parked_devices_alone(self):
+        import json as _json
+        self.bridge.handle({"cmd": "mode", "device": "KB77", "mode": 2})
+        reverted = _json.loads(_json.dumps(self.server.rig))
+        reverted[3]["colors"] = [0x00FF00] * 104
+        self.server.set_rig(reverted)
+        before = len([p for p in self.server.control_packets(1050) if p[0] == 3])
+        self.bridge.check_drift()
+        time.sleep(0.15)
+        after = len([p for p in self.server.control_packets(1050) if p[0] == 3])
+        self.assertEqual(after, before)  # parked: its own show runs freely
+
     def test_apply_emits_light_colors_event_not_full_rig(self):
         rig_events = [e for e in self.events if e.get("event") == "rig"]
         colors_events = [e for e in self.events if e.get("event") == "colors"]

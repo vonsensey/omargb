@@ -334,6 +334,18 @@ Item {
           }
         }
 
+        Text {
+          width: parent.width
+          visible: root.connected && !root.showDoctor && root.devices.length > 0
+          text: "Roles wear your THEME's version of each color - a jade theme's \"yellow\" is green. Click a zone's swatch to pick an exact color instead."
+          textFormat: Text.PlainText
+          wrapMode: Text.WordWrap
+          color: root.foreground
+          opacity: 0.45
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.small
+        }
+
         PanelSeparator { width: parent.width }
 
         // ------------------------------------------------------- content

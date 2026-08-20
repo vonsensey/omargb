@@ -702,6 +702,7 @@ class Bridge:
         self.hw_mode = set()
         self.retry_delay = 1.0
         self.next_retry = 0.0
+        self.next_drift = 0.0      # next drift-watchdog pass (monotonic)
         self.spawn_last = 0.0      # monotonic time of the last spawn attempt
         self.commands = queue.Queue()
         self.running = True
@@ -852,6 +853,36 @@ class Bridge:
             emit({"event": "colors",
                   "devices": {str(i): self.applied[i] for i in changed}})
         return bool(changed)
+
+    def check_drift(self):
+        """Devices silently revert to onboard lighting: a wireless keyboard
+        waking from power-save plays its saved effect (rainbow) until the
+        host re-asserts Direct mode. Re-read each managed device's colors
+        and repaint whatever no longer shows what we applied. Parked
+        hardware-mode devices run their own show and are never touched.
+        """
+        if self.client is None or not self.client.connected:
+            return
+        drifted = []
+        for idx in list(self.applied):
+            if idx >= len(self.rig):
+                continue
+            if device_key(self.rig[idx]) in self.hw_mode:
+                continue
+            try:
+                dev = self.client.controller_data(idx)
+            except OrgbError as e:
+                self.drop_connection(e)
+                return
+            shown = [wire_to_color(c) for c in dev.get("colors", [])]
+            if shown and shown != self.applied[idx]:
+                self.rig[idx] = dev
+                self.direct_set.discard(idx)  # it may have left Direct too
+                del self.applied[idx]
+                drifted.append(idx)
+        if drifted:
+            emit({"event": "drift", "devices": drifted})
+            self.apply()
 
     def persist_state(self):
         try:
@@ -1068,6 +1099,9 @@ class Bridge:
                 self.overlay = None
                 self.flash_until = None
                 self.apply(force=True)
+            if connected and time.monotonic() >= self.next_drift:
+                self.next_drift = time.monotonic() + 20.0
+                self.check_drift()
             try:
                 cmd = self.commands.get(timeout=0.2)
             except queue.Empty:
