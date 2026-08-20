@@ -25,7 +25,8 @@ PKT_PROFILE_LOAD = 152
 
 
 class MockOrgbServer:
-    def __init__(self, rig, protocol=5, mute_version=False, refuse_first=0):
+    def __init__(self, rig, protocol=5, mute_version=False, refuse_first=0,
+                 port=0):
         self.rig = list(rig)
         self.protocol = protocol
         self.mute_version = mute_version
@@ -37,7 +38,7 @@ class MockOrgbServer:
         self.conn = None
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.listener.bind(("127.0.0.1", 0))
+        self.listener.bind(("127.0.0.1", port))
         self.listener.listen(4)
         self.port = self.listener.getsockname()[1]
         self.running = True
@@ -147,5 +148,33 @@ class MockOrgbServer:
                 with self.lock:
                     self.received.append((dev_id, pkt_id, payload))
             else:
+                if pkt_id == 1050 and dev_id < len(self.rig):
+                    # Real OpenRGB reflects UpdateLEDs in controller data;
+                    # mirror that so clients re-reading colors see them.
+                    (count,) = struct.unpack("<H", payload[4:6])
+                    colors = list(struct.unpack("<%dI" % count, payload[6:6 + 4 * count]))
+                    dev = dict(self.rig[dev_id])
+                    dev["colors"] = colors
+                    self.rig[dev_id] = dev
                 with self.lock:
                     self.received.append((dev_id, pkt_id, payload))
+
+
+if __name__ == "__main__":
+    # Dev rig: serve the six fixture devices on the real SDK port so the
+    # plugin can be exercised on a machine with no RGB hardware at all.
+    #   python3 test/mock_server.py [port]
+    import sys
+    import time as _time
+
+    import orgb_rig
+
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 6742
+    server = MockOrgbServer(orgb_rig.RIG, port=port)
+    print("mock OpenRGB server on 127.0.0.1:%d (fixture rig, 6 devices)"
+          % server.port, flush=True)
+    try:
+        while True:
+            _time.sleep(3600)
+    except KeyboardInterrupt:
+        server.stop()

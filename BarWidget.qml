@@ -15,13 +15,12 @@ BarWidget {
   readonly property var svc: bar && bar.shell ? bar.shell.serviceFor(pluginId) : null
 
   readonly property int count: svc ? svc.deviceCount : 0
-  readonly property bool healthy: svc && svc.serverConnected && !svc.openrgbMissing
+  readonly property bool healthy: svc ? svc.serverConnected === true : false
   readonly property bool powerOn: svc ? svc.powerOn : true
   readonly property string glyph: {
     if (!svc || !svc.bridgeUp) return "󰔟"      // starting
     if (svc.openrgbMissing) return "󰦉"          // doctor has news
-    if (!svc.serverConnected) return "󰔟"        // connecting
-    return "󰌵"
+    return "󰔟"                                  // connecting
   }
 
   implicitWidth: root.vertical ? barSize : row.width + Style.space(14)

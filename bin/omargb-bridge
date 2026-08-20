@@ -739,7 +739,10 @@ class Bridge:
                     "override": self.state["overrides"].get(key, {}).get(str(z_idx)),
                     "matrix": z["matrix"],
                 } for z_idx, z in enumerate(dev.get("zones", []))],
-                "colors": [wire_to_color(c) for c in dev.get("colors", [])],
+                # What we last applied is fresher than the enumeration-time
+                # snapshot; the panel should show what the LEDs are showing.
+                "colors": self.applied.get(idx) or
+                          [wire_to_color(c) for c in dev.get("colors", [])],
             })
         emit({"event": "rig", "devices": devices,
               "state": {"power": self.state["power"],
@@ -772,6 +775,7 @@ class Bridge:
             changed.append(idx)
         if changed:
             emit({"event": "applied", "devices": changed})
+            self.emit_rig()
 
     def persist_state(self):
         save_state(self.state_dir, self.state)

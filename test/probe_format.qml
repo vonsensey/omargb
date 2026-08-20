@@ -26,6 +26,8 @@ QtObject {
     ok("status: no devices", Format.statusLabel(true, true, false, 0) === "no devices")
     ok("status: singular", Format.statusLabel(true, true, false, 1) === "1 device")
     ok("status: plural", Format.statusLabel(true, true, false, 6) === "6 devices")
+    ok("status: live server outranks missing binary",
+       Format.statusLabel(true, true, true, 6) === "6 devices")
 
     ok("doctorBadge: fail wins", Format.doctorBadge(
          [{status:"ok"},{status:"warn"},{status:"fail"}]) === "fail")
@@ -43,6 +45,10 @@ QtObject {
     ok("hex->hsv->hex roundtrip", Format.hsvToHex(rt.h, rt.s, rt.v) === "#f38d70")
     var corner = Format.hexToHsv("#000000")
     ok("black hsv is v=0", corner.v === 0 && corner.s === 0)
+
+    ok("zoneStart first is 0", Format.zoneStart([{ledsCount:1},{ledsCount:12}], 0) === 0)
+    ok("zoneStart sums preceding", Format.zoneStart([{ledsCount:1},{ledsCount:12},{ledsCount:8}], 2) === 13)
+    ok("zoneStart clamps", Format.zoneStart([{ledsCount:5}], 3) === 5)
 
     var matrix = { height: 2, width: 3, map: [0, 4294967295, 1, 2, 3, 4294967295] }
     var cell = Format.matrixCell(matrix, 2)
