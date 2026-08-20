@@ -117,6 +117,21 @@ Rainbow, a loaded profile) is *parked* — theme applies, lock dimming, and
 brightness leave it alone until you change its color or role, or switch
 themes (an explicit theme change restyles the whole rig).
 
+## On real hardware
+
+<img src="docs/img/omen-real-hardware.png" width="420" align="right" alt="OmaRGB on an HP Omen 30L: seven case zones themed, a G915 TKL rendered as its real per-key matrix wearing the off role">
+
+This is OmaRGB on an HP Omen 30L: all seven case zones (logo, light bar,
+four fans, CPU cooler) wearing the theme's accent, a Logitech G915 TKL
+rendered as its real 7x20 per-key matrix — dark, because its role is `off` —
+and a G502 below. `omarchy-theme-set tokyo-night` turns the physical case
+blue in about a second; switching back returns it to peach. The `off` role
+is the night setup: case themed, peripherals dark, and with "When the
+session locks: Lights off", locking the machine darkens everything and
+unlock restores it exactly.
+
+<br clear="right">
+
 ## No RGB hardware handy?
 
 The repo ships the test rig as a runnable fake:
@@ -170,9 +185,12 @@ as in-process bindings.
   mock rig (screenshots above are real captures).
 - The wire protocol is implemented from OpenRGB 1.0rc3's own headers and SDK
   documentation (protocol 5 — what Arch ships today), with graceful
-  negotiation down to protocol 0 for old servers. If a device of yours
-  misbehaves, open an issue with `openrgb --loglevel 6` output — the device
-  layer is OpenRGB's own, so quirks usually reproduce in its GUI too.
+  negotiation down to protocol 0 for old servers — and validated against a
+  real OpenRGB 1.0rc3 server driving real hardware: an HP Omen 30L (7 zones),
+  a Logitech G915 TKL (95-key matrix), and a G502 mouse, including live theme
+  morphs, per-device roles, and the shell-IPC automation surface. If a device
+  of yours misbehaves, open an issue with `openrgb --loglevel 6` output — the
+  device layer is OpenRGB's own, so quirks usually reproduce in its GUI too.
 
 ## License
 
