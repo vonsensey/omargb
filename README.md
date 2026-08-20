@@ -37,6 +37,8 @@ lights up.*
 - **One engine, every vendor.** OpenRGB supports hundreds of devices across
   ASUS, Corsair, Razer, Logitech, G.Skill, NZXT, MSI and more. OmaRGB speaks
   its SDK protocol directly — one plugin instead of one widget per brand.
+- **Scriptable, all of it.** Everything the panel does is one shell command
+  away — for keybinds, cron jobs, and agents (see Automation below).
 
 ## Install
 
@@ -88,6 +90,33 @@ OmaRGB is the whole-rig, whole-palette version of the same idea. If you have
 one of those devices, both will write to it on theme change — last writer
 wins, and OmaRGB runs later, so its zone roles win.
 
+## Automation
+
+Every control in the panel is reachable headlessly through the shell IPC —
+`command` takes the same JSON the internals speak, `status` returns the full
+picture (devices, zones, doctor report, profiles):
+
+```
+# lights out at bedtime (cron it, bind it, let your agent call it)
+omarchy-shell shell call io.github.vonsensey.omargb command '{"cmd":"power","on":false}'
+
+# the whole rig state as JSON
+omarchy-shell shell call io.github.vonsensey.omargb status ''
+
+# paint one zone, set a role, load a profile...
+omarchy-shell shell call io.github.vonsensey.omargb command '{"cmd":"set-zone-color","device":"KB77","zone":0,"color":"#a55555"}'
+omarchy-shell shell call io.github.vonsensey.omargb command '{"cmd":"set-role","device":"CL9","role":"urgent"}'
+omarchy-shell shell call io.github.vonsensey.omargb command '{"cmd":"profile-load","name":"gaming"}'
+```
+
+The Doctor also runs standalone, no shell needed:
+`~/.config/omarchy/plugins/io.github.vonsensey.omargb/bin/omargb-bridge doctor`
+
+One semantic worth knowing: a device you move to a hardware effect (Breathing,
+Rainbow, a loaded profile) is *parked* — theme applies, lock dimming, and
+brightness leave it alone until you change its color or role, or switch
+themes (an explicit theme change restyles the whole rig).
+
 ## No RGB hardware handy?
 
 The repo ships the test rig as a runnable fake:
@@ -114,8 +143,10 @@ Does not:
   *suggests* commands; it never runs them — you do, with sudo, if you agree)
 - No network beyond **one TCP connection to 127.0.0.1:6742**, the local
   OpenRGB SDK server. Nothing leaves your machine, ever. The only process
-  it starts is `openrgb --server --server-host 127.0.0.1` (loopback-only),
-  and only when no server is running.
+  it starts is `openrgb --startminimized --server --server-host 127.0.0.1`
+  (loopback-only), and only when no server is answering. (OpenRGB itself
+  keeps its own configuration under `~/.config/OpenRGB`, as it does however
+  you start it.)
 
 The bridge is a single pure-python3-stdlib file (`bin/omargb-bridge`) that
 implements the OpenRGB SDK wire protocol (versions 0–5) itself. You can read
@@ -129,10 +160,12 @@ as in-process bindings.
 
 ## Tested how
 
-- 48 Python tests: the wire protocol (byte-exact golden vectors, protocol
-  0/3/5 servers), palette mapping precedence, overlay restore semantics, and
-  the Doctor against fabricated machines — all against a mock SDK server
-  whose serializer is written independently of the bridge's parser.
+- 64 Python tests: the wire protocol (byte-exact golden vectors, protocol
+  0/3/5 servers), palette mapping precedence, overlay restore semantics, the
+  Doctor against fabricated machines, and a hostile-server gauntlet
+  (truncated replies, forged LED counts, oversized packets, mid-setup
+  disconnects, bad command values, full disks) — all against a mock SDK
+  server whose serializer is written independently of the bridge's parser.
 - QML logic probed headlessly; UI exercised live on Omarchy 4.0 against the
   mock rig (screenshots above are real captures).
 - The wire protocol is implemented from OpenRGB 1.0rc3's own headers and SDK
