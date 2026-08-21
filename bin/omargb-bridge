@@ -33,6 +33,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -478,10 +479,23 @@ def load_state(state_dir):
 
 def save_state(state_dir, state):
     os.makedirs(state_dir, exist_ok=True)
-    tmp = state_path(state_dir) + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp, state_path(state_dir))
+    # A predictable tmp name is a symlink-redirection hazard: a pre-planted
+    # link at that path would receive the truncating write. mkstemp creates
+    # with O_CREAT|O_EXCL|O_NOFOLLOW and an unpredictable name, closing the
+    # class; the replace stays atomic.
+    fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".state-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, state_path(state_dir))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def device_key(dev):

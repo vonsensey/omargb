@@ -175,6 +175,24 @@ class StateSafety(unittest.TestCase):
         self.assertTrue(any(e.get("event") == "error" and "save" in e.get("message", "")
                             for e in events))
 
+    def test_state_write_defeats_preplanted_symlink(self):
+        # Marketplace review finding: a symlink pre-planted at the old
+        # predictable tmp path must never receive the write.
+        import json as _json
+        d = tempfile.mkdtemp(prefix="omargb-rb-")
+        victim = os.path.join(d, "victim.txt")
+        with open(victim, "w") as f:
+            f.write("precious")
+        os.symlink(victim, os.path.join(d, "state.json.tmp"))
+        B.save_state(d, dict(B.DEFAULT_STATE))
+        with open(victim) as f:
+            self.assertEqual(f.read(), "precious")  # untouched
+        with open(os.path.join(d, "state.json")) as f:
+            self.assertEqual(_json.load(f)["schemaVersion"], 1)
+        stray = [n for n in os.listdir(d)
+                 if n.startswith(".state-") and n.endswith(".tmp")]
+        self.assertEqual(stray, [])  # no leftovers on the success path
+
     def test_bad_hex_override_is_refused(self):
         server = MockOrgbServer(orgb_rig.RIG)
         self.addCleanup(server.stop)
