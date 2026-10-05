@@ -79,7 +79,7 @@ BarWidget {
       textFormat: Text.PlainText
       color: root.bar ? root.bar.barForeground : Color.foreground
       font.family: root.bar ? root.bar.fontFamily : ""
-      font.pixelSize: Style.fontSize(12)
+      font.pixelSize: Style.font.body
       text: root.healthy ? String(root.count) : root.glyph
       opacity: root.healthy ? 0.9 : 0.6
     }

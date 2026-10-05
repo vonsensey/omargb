@@ -72,6 +72,21 @@ PKT_RGB_SAVE_MODE = 1102
 
 ZONE_SINGLE, ZONE_LINEAR, ZONE_MATRIX = 0, 1, 2
 MATRIX_EMPTY = 0xFFFFFFFF
+MODE_FLAG_HAS_PER_LED_COLOR = 1 << 5
+
+# Gigabyte RGB Fusion 2 devices (IT5711 boards, Blackwell GPUs) accept Direct
+# mode but never show it; Static does show (seen 2026-10-05, OpenRGB 1.0.8).
+STATIC_VENDORS = ("Gigabyte",)
+
+
+def static_mode_index(dev):
+    """Index of the Static mode to paint with instead of Direct, or None."""
+    if dev.get("vendor") not in STATIC_VENDORS:
+        return None
+    for i, mode in enumerate(dev.get("modes", [])):
+        if mode["name"] == "Static":
+            return i
+    return None
 
 DEVICE_TYPE_NAMES = [
     "motherboard", "dram", "gpu", "cooler", "ledstrip", "keyboard",
@@ -708,6 +723,9 @@ class Bridge:
         self.base_targets = {}
         self.applied = {}          # what the devices are actually showing
         self.direct_set = set()    # device indexes already switched to Direct
+        # Device indexes painted through a Static mode color. Their per-LED
+        # color list never changes, so the drift watchdog skips them.
+        self.mode_color = set()
         self.overlay = None        # None | ("dim", f) | ("flash", color)
         self.flash_until = None
         # Devices (by key) the user moved to a hardware effect mode: theme
@@ -746,6 +764,7 @@ class Bridge:
         self.client = client
         self.retry_delay = 1.0
         self.direct_set = set()
+        self.mode_color = set()
         self.applied = {}
         emit({"event": "connected", "protocol": client.protocol})
         self.refresh_rig()
@@ -852,11 +871,23 @@ class Bridge:
                 continue  # the user picked a hardware effect; hands off
             if not force and self.applied.get(idx) == colors:
                 continue
+            dev = self.rig[idx] if idx < len(self.rig) else {}
+            static = static_mode_index(dev)
             try:
-                if idx not in self.direct_set:
-                    self.client.set_custom_mode(idx)
-                    self.direct_set.add(idx)
-                self.client.update_leds(idx, [color_to_wire(c) for c in colors])
+                if static is not None and not (
+                        dev["modes"][static]["flags"] & MODE_FLAG_HAS_PER_LED_COLOR):
+                    # One color for the whole device, carried by the mode.
+                    mode = dict(dev["modes"][static], colors=[color_to_wire(colors[0])])
+                    self.client.update_mode(idx, static, mode)
+                    self.mode_color.add(idx)
+                else:
+                    if idx not in self.direct_set:
+                        if static is not None:
+                            self.client.update_mode(idx, static, dev["modes"][static])
+                        else:
+                            self.client.set_custom_mode(idx)
+                        self.direct_set.add(idx)
+                    self.client.update_leds(idx, [color_to_wire(c) for c in colors])
             except OrgbError as e:
                 self.drop_connection(e)
                 return False
@@ -881,7 +912,7 @@ class Bridge:
         for idx in list(self.applied):
             if idx >= len(self.rig):
                 continue
-            if device_key(self.rig[idx]) in self.hw_mode:
+            if device_key(self.rig[idx]) in self.hw_mode or idx in self.mode_color:
                 continue
             try:
                 dev = self.client.controller_data(idx)
@@ -1041,6 +1072,7 @@ class Bridge:
                     self.drop_connection(e)
                     return
                 self.direct_set = set()
+                self.mode_color = set()
                 self.applied = {}
                 self.refresh_rig()
                 # Deliberately no apply(): loading a profile means the user
@@ -1075,6 +1107,7 @@ class Bridge:
         elif name == "rescan":
             if self.client and self.client.connected:
                 self.direct_set = set()
+                self.mode_color = set()
                 self.applied = {}
                 self.refresh_rig()
                 self.apply()
@@ -1106,6 +1139,7 @@ class Bridge:
                     connected = False
             if connected and self.client.rig_dirty:
                 self.direct_set = set()
+                self.mode_color = set()
                 self.applied = {}
                 self.refresh_rig()
                 self.apply()

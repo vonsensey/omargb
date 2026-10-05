@@ -26,7 +26,10 @@ Item {
   property var manifest: null
 
   readonly property string pluginId: (manifest && manifest.id) || "io.github.vonsensey.omargb"
-  readonly property string sourceDir: (manifest && manifest.__sourceDir) ? String(manifest.__sourceDir) : ""
+  readonly property string sourceDir: {
+    if (manifest && manifest.__sourceDir) return String(manifest.__sourceDir)
+    return decodeURIComponent(String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "")).replace(/\/$/, "")
+  }
 
   // ------------------------------------------------------------- settings
   // Read from the bar layout entry the widget writes, exactly as the widget
@@ -132,11 +135,15 @@ Item {
     // Pinned system interpreter: version-manager shims (mise/pyenv) can put
     // an arbitrary python3 first on PATH. Invoked through the interpreter
     // rather than the shebang so a checkout without exec bits still works.
-    command: ["/usr/bin/python3", root.sourceDir + "/bin/omargb-bridge"]
+    command: ["/usr/bin/python3", "-u", root.sourceDir + "/bin/omargb-bridge"]
     stdinEnabled: true
     stdout: SplitParser {
       splitMarker: "\n"
       onRead: function(line) { root.handleLine(line) }
+    }
+    stderr: SplitParser {
+      splitMarker: "\n"
+      onRead: function(line) { console.warn("omargb-bridge: " + line) }
     }
     onExited: {
       root.serverConnected = false
@@ -158,6 +165,7 @@ Item {
   // launches with an empty sourceDir path (before manifest injection).
   function syncBridge() {
     if (sourceDir !== "" && !bridge.running) {
+      bridge.command = ["/usr/bin/python3", "-u", root.sourceDir + "/bin/omargb-bridge"]
       bridge.running = true
       firstDoctor.restart()
     }
@@ -173,6 +181,9 @@ Item {
   }
   onSourceDirChanged: Qt.callLater(syncBridge)
   Component.onCompleted: Qt.callLater(syncBridge)
+  Component.onDestruction: {
+    bridge.running = false
+  }
 
   // ---------------------------------------------------------------- theme
   // One string so a theme push (which reassigns every role at once) costs a
@@ -203,7 +214,7 @@ Item {
     id: themeColor
     running: false
     command: ["omarchy-theme-color", "--all"]
-    stdout: StdioCollector { id: paletteOut }
+    stdout: StdioCollector { id: paletteOut; waitForEnd: true }
     onExited: function(code) {
       if (code === 0 && paletteOut.text !== "") {
         // The resolver does not emit `urgent` (it is a shell-derived role,

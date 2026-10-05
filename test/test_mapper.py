@@ -94,5 +94,15 @@ class Mapper(unittest.TestCase):
         self.assertEqual(B.device_key({"name": "X"}), "X")
 
 
+class StaticModeTests(unittest.TestCase):
+    def test_gigabyte_paints_with_static(self):
+        dev = {"vendor": "Gigabyte", "modes": [{"name": "Direct"}, {"name": "Static"}]}
+        self.assertEqual(B.static_mode_index(dev), 1)
+
+    def test_other_vendors_keep_direct(self):
+        dev = {"vendor": "ASUS", "modes": [{"name": "Direct"}, {"name": "Static"}]}
+        self.assertIsNone(B.static_mode_index(dev))
+
+
 if __name__ == "__main__":
     unittest.main()
