@@ -22,6 +22,7 @@ packet u32, size u32}, little-endian throughout. RGBColor is
 CLI: `omargb-bridge doctor` prints the setup diagnosis as JSON and exits.
 """
 
+import colorsys
 import glob
 import json
 import os
@@ -453,6 +454,7 @@ DEFAULT_STATE = {
     "zone_roles": {},   # device key -> {zone index (str) -> role}
     "overrides": {},    # device key -> {zone index (str) -> "#rrggbb"}
     "palette": {},      # last palette received from the shell
+    "vivid": False,     # boost pastel theme colors for LEDs
 }
 
 
@@ -509,18 +511,31 @@ def device_key(dev):
 ROLE_FALLBACK = "accent"
 
 
-def resolve_role(palette, role):
-    """Role name -> '#rrggbb' from the resolved theme palette."""
+def vivid(hexcolor, min_sat=0.9):
+    """Terminal themes lean on pastels, which read as washed-out white on
+    LEDs. Keep the hue, raise saturation and brightness. Neutrals (text,
+    muted) and dark colors (background) are left alone."""
+    h = hexcolor.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    hue, sat, val = colorsys.rgb_to_hsv(r, g, b)
+    if sat < 0.12 or val < 0.3:
+        return "#" + h
+    r, g, b = colorsys.hsv_to_rgb(hue, max(sat, min_sat), 1.0)
+    return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+def resolve_role(palette, role, boost=False):
+    """Role name -> '#rrggbb' from the resolved theme palette. With `boost`,
+    palette colors are made LED-vivid (see vivid())."""
     if role == "off":
         # A real role, not just power: one device dark while the rest of the
         # rig wears the theme (keyboard dark at night, cooler still themed).
         return "#000000"
     value = palette.get(role)
+    if not valid_hex(value):
+        value = palette.get(ROLE_FALLBACK)
     if valid_hex(value):
-        return value[:7]
-    value = palette.get(ROLE_FALLBACK)
-    if valid_hex(value):
-        return value[:7]
+        return vivid(value[:7]) if boost else value[:7]
     return "#ffffff"
 
 
@@ -548,11 +563,13 @@ def compute_targets(rig, state):
             override = overrides.get(str(zone_idx))
             if override is not None and not valid_hex(override):
                 override = None
-            base = override or resolve_role(state["palette"], zone_role(state, key, zone_idx))
+            base = override or resolve_role(state["palette"], zone_role(state, key, zone_idx),
+                                            state.get("vivid", False))
             colors.extend([scale_color(base, factor)] * zone["leds_count"])
         led_total = len(dev.get("leds", []))
         if led_total > len(colors):
-            pad = resolve_role(state["palette"], state["roles"].get(key, ROLE_FALLBACK))
+            pad = resolve_role(state["palette"], state["roles"].get(key, ROLE_FALLBACK),
+                               state.get("vivid", False))
             colors.extend([scale_color(pad, factor)] * (led_total - len(colors)))
         targets[idx] = colors
     return targets
@@ -928,6 +945,7 @@ class Bridge:
                         palette[parts[0].strip()] = parts[1].strip()
             if isinstance(palette, dict) and palette:
                 self.state["palette"] = palette
+                self.state["vivid"] = bool(cmd.get("vivid", False))
                 # An explicit theme change restyles the whole rig, including
                 # devices previously parked on a hardware effect.
                 self.hw_mode = set()

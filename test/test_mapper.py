@@ -31,6 +31,30 @@ def state(**kw):
     return s
 
 
+class Vivid(unittest.TestCase):
+    PASTEL = {"accent": "#81a2be", "background": "#151719", "foreground": "#c5c8c6"}
+
+    def test_off_by_default_keeps_palette_colors(self):
+        self.assertEqual(B.resolve_role(self.PASTEL, "accent"), "#81a2be")
+        t = B.compute_targets(rig(), state(palette=self.PASTEL))
+        self.assertTrue(all(c == "#81a2be" for c in t[0]))
+
+    def test_boost_saturates_pastels_and_keeps_hue(self):
+        out = B.resolve_role(self.PASTEL, "accent", True)
+        self.assertEqual(out, "#1996ff")
+        r, g, b = (int(out[i:i + 2], 16) for i in (1, 3, 5))
+        self.assertEqual(max(r, g, b), 255)
+
+    def test_boost_leaves_neutrals_dark_and_off_alone(self):
+        self.assertEqual(B.resolve_role(self.PASTEL, "foreground", True), "#c5c8c6")
+        self.assertEqual(B.resolve_role(self.PASTEL, "background", True), "#151719")
+        self.assertEqual(B.resolve_role(self.PASTEL, "off", True), "#000000")
+
+    def test_vivid_flag_reaches_targets(self):
+        t = B.compute_targets(rig(), state(palette=self.PASTEL, vivid=True))
+        self.assertTrue(all(c == "#1996ff" for c in t[0]))
+
+
 class Mapper(unittest.TestCase):
     def test_default_everything_wears_accent(self):
         targets = B.compute_targets(rig(), state())

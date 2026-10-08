@@ -39,6 +39,7 @@ Item {
 
   readonly property bool followTheme: Format.isOn(setting("followTheme", "On"), true)
   readonly property string lockAction: String(setting("lockAction", "Dim"))
+  readonly property bool vividColors: Format.isOn(setting("vividColors", "Off"), false)
   readonly property bool urgentFlash: Format.isOn(setting("urgentFlash", "On"), true)
 
   // ---------------------------------------------------------------- state
@@ -183,6 +184,7 @@ Item {
   ].join("|")
   onThemeKeyChanged: paletteDebounce.restart()
   onFollowThemeChanged: if (followTheme) paletteDebounce.restart()
+  onVividColorsChanged: paletteDebounce.restart()
 
   Timer {
     id: paletteDebounce
@@ -210,7 +212,8 @@ Item {
         // not a colors.toml key) - append the shell's resolved value so the
         // urgent role maps to the color users expect.
         root.send({ cmd: "set-palette",
-                    raw: paletteOut.text + "\nurgent\t" + Format.hex6(Color.urgent) })
+                    raw: paletteOut.text + "\nurgent\t" + Format.hex6(Color.urgent),
+                    vivid: root.vividColors })
       }
     }
   }
