@@ -22,9 +22,11 @@
     "defaults": {
       "followTheme": "On",
       "lockAction": "Dim",
-      "urgentFlash": "On"
+      "urgentFlash": "On",
+      "vividColors": "Off"
     },
     "schema": [
+      { "key": "vividColors", "type": "enum", "label": "Vivid LED colors", "options": ["On", "Off"], "defaultValue": "Off", "description": "Pastel themes look washed out or white on LEDs. On keeps each theme color's hue but raises its saturation and brightness. Neutrals and dark colors are untouched." },
       { "key": "followTheme", "type": "enum", "label": "Follow the Omarchy theme", "options": ["On", "Off"], "defaultValue": "On", "description": "Repaint every managed device from the theme palette the moment the theme changes." },
       { "key": "lockAction", "type": "enum", "label": "When the session locks", "options": ["Dim", "Lights off", "Nothing"], "defaultValue": "Dim", "description": "Lights restore to their exact previous state on unlock." },
       { "key": "urgentFlash", "type": "enum", "label": "Flash on urgent window", "options": ["On", "Off"], "defaultValue": "On", "description": "Pulse managed devices in the theme's urgent color when a window demands attention." }
