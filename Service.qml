@@ -26,7 +26,7 @@ Item {
   property var manifest: null
 
   readonly property string pluginId: (manifest && manifest.id) || "io.github.vonsensey.omargb"
-  readonly property string sourceDir: (manifest && manifest.__sourceDir) ? String(manifest.__sourceDir) : ""
+  readonly property string sourceDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")  // host strips manifest.__sourceDir for third-party plugins
 
   // ------------------------------------------------------------- settings
   // Read from the bar layout entry the widget writes, exactly as the widget
@@ -69,6 +69,16 @@ Item {
   }
   readonly property string statusLabel: Format.statusLabel(
     bridgeUp, serverConnected, openrgbMissing, deviceCount)
+
+  // Replacement bars give widgets no serviceFor(), so mirror the few fields
+  // the bar widget shows into a runtime file it can watch instead.
+  readonly property string statusPath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omargb-status.json"
+  readonly property string statusJson: JSON.stringify({
+    bridgeUp: bridgeUp, serverConnected: serverConnected, deviceCount: deviceCount,
+    powerOn: powerOn, openrgbMissing: openrgbMissing, statusLabel: statusLabel
+  })
+  onStatusJsonChanged: statusFile.setText(statusJson)
+  FileView { id: statusFile; path: root.statusPath; atomicWrites: true }
 
   function send(cmd) {
     if (bridge.running) bridge.write(JSON.stringify(cmd) + "\n")
@@ -172,7 +182,7 @@ Item {
     onTriggered: root.send({ cmd: "doctor" })
   }
   onSourceDirChanged: Qt.callLater(syncBridge)
-  Component.onCompleted: Qt.callLater(syncBridge)
+  Component.onCompleted: { statusFile.setText(statusJson); Qt.callLater(syncBridge) }
 
   // ---------------------------------------------------------------- theme
   // One string so a theme push (which reassigns every role at once) costs a

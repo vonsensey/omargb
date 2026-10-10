@@ -205,7 +205,7 @@ Item {
             color: root.foreground
             opacity: 0.55
             font.family: root.fontFamily
-            font.pixelSize: Style.font.small
+            font.pixelSize: Style.font.bodySmall
           }
 
           Row {
@@ -255,7 +255,7 @@ Item {
               color: root.foreground
               opacity: 0.8
               font.family: root.fontFamily
-              font.pixelSize: Style.font.small
+              font.pixelSize: Style.font.bodySmall
             }
             PanelSlider {
               width: brightRow.width - Style.space(180)
@@ -276,7 +276,7 @@ Item {
               color: root.foreground
               opacity: 0.6
               font.family: root.fontFamily
-              font.pixelSize: Style.font.small
+              font.pixelSize: Style.font.bodySmall
             }
           }
         }
@@ -299,7 +299,7 @@ Item {
               color: root.foreground
               opacity: 0.8
               font.family: root.fontFamily
-              font.pixelSize: Style.font.small
+              font.pixelSize: Style.font.bodySmall
             }
             Repeater {
               model: root.svc ? root.svc.profiles : []
@@ -343,7 +343,7 @@ Item {
           color: root.foreground
           opacity: 0.45
           font.family: root.fontFamily
-          font.pixelSize: Style.font.small
+          font.pixelSize: Style.font.bodySmall
         }
 
         PanelSeparator { width: parent.width }
@@ -441,7 +441,7 @@ Item {
                       color: root.foreground
                       opacity: 0.85
                       font.family: "monospace"
-                      font.pixelSize: Style.font.small
+                      font.pixelSize: Style.font.bodySmall
                     }
                     Text {
                       id: copyGlyph
@@ -526,7 +526,7 @@ Item {
                       color: root.foreground
                       opacity: 0.5
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.small
+                      font.pixelSize: Style.font.bodySmall
                       anchors.verticalCenter: parent.verticalCenter
                     }
                   }
@@ -543,7 +543,7 @@ Item {
                       color: root.foreground
                       opacity: 0.6
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.small
+                      font.pixelSize: Style.font.bodySmall
                     }
                     Dropdown {
                       width: Style.space(150)
@@ -585,7 +585,7 @@ Item {
                         color: root.foreground
                         opacity: 0.85
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.small
+                        font.pixelSize: Style.font.bodySmall
                       }
 
                       Dropdown {
@@ -694,7 +694,7 @@ Item {
           color: root.foreground
           opacity: 0.4
           font.family: root.fontFamily
-          font.pixelSize: Style.font.small
+          font.pixelSize: Style.font.bodySmall
         }
       }
     }

@@ -1,4 +1,6 @@
 import QtQuick
+import Quickshell
+import Quickshell.Io
 import qs.Ui
 import qs.Commons
 import "lib/format.js" as Format
@@ -14,13 +16,27 @@ BarWidget {
   readonly property string pluginId: "io.github.vonsensey.omargb"
   readonly property var svc: bar && bar.shell ? bar.shell.serviceFor(pluginId) : null
 
-  readonly property int count: svc ? svc.deviceCount : 0
-  readonly property bool healthy: svc ? svc.serverConnected === true : false
-  readonly property bool powerOn: svc ? svc.powerOn : true
+  // Stock bar: live service. Replacement bars get no serviceFor(), so fall
+  // back to the status file the service publishes.
+  property var snap: ({})
+  FileView {
+    id: statusFile
+    path: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omargb-status.json"
+    watchChanges: true
+    onFileChanged: reload()
+    onLoaded: { try { root.snap = JSON.parse(text()) } catch (e) {} }
+  }
+  readonly property bool live: svc !== null && svc !== undefined
+  readonly property int count: live ? svc.deviceCount : (snap.deviceCount || 0)
+  readonly property bool healthy: live ? svc.serverConnected === true : snap.serverConnected === true
+  readonly property bool powerOn: live ? svc.powerOn : snap.powerOn !== false
+  readonly property bool bridgeUp: live ? svc.bridgeUp : snap.bridgeUp === true
+  readonly property bool openrgbMissing: live ? svc.openrgbMissing : snap.openrgbMissing === true
+  readonly property string statusLabel: live ? svc.statusLabel : (snap.statusLabel || "")
   readonly property string glyph: {
-    if (!svc || !svc.bridgeUp) return "󰔟"      // starting
-    if (svc.openrgbMissing) return "󰦉"          // doctor has news
-    return "󰔟"                                  // connecting
+    if (!bridgeUp) return "󰔟"      // starting
+    if (openrgbMissing) return "󰦉"   // doctor has news
+    return "󰔟"                        // connecting
   }
 
   implicitWidth: root.vertical ? barSize : row.width + Style.space(14)
@@ -79,16 +95,16 @@ BarWidget {
       textFormat: Text.PlainText
       color: root.bar ? root.bar.barForeground : Color.foreground
       font.family: root.bar ? root.bar.fontFamily : ""
-      font.pixelSize: Style.fontSize(12)
+      font.pixelSize: Style.fontPx(1.0)
       text: root.healthy ? String(root.count) : root.glyph
       opacity: root.healthy ? 0.9 : 0.6
     }
   }
 
   function tooltipText() {
-    if (!root.svc) return "OmaRGB"
-    var line = "OmaRGB - " + root.svc.statusLabel
-    if (root.svc.openrgbMissing) line += ". Click for the Doctor."
+    if (!root.statusLabel) return "OmaRGB"
+    var line = "OmaRGB - " + root.statusLabel
+    if (root.openrgbMissing) line += ". Click for the Doctor."
     else if (root.healthy) line += (root.powerOn ? "" : " (lights off)") + ". Right click toggles lights."
     return line
   }
@@ -101,7 +117,7 @@ BarWidget {
 
     onClicked: function(mouse) {
       if (mouse.button === Qt.RightButton) {
-        if (root.svc) root.svc.send({ cmd: "power", on: !root.powerOn })
+        if (root.live) root.svc.send({ cmd: "power", on: !root.powerOn })
       } else if (root.bar && root.bar.shell) {
         root.bar.shell.toggle(root.pluginId, "{}")
       }
